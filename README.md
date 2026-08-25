@@ -4,6 +4,7 @@
 
 This repository provides a self-sufficient local proxy and patcher for **Antigravity IDE** (`Antigravity IDE.exe`). It enables external AI models (OpenAI, Anthropic Claude, Moonshot / Kimi, Together AI, OpenRouter, Ollama, Google AI Studio, Groq, Mistral, and any OpenAI-compatible provider) to appear and function inside the Antigravity IDE chat dropdown with full support for streaming, function calling, and tool usage.
 
+The project is based on the work of vahapogut (original creator), and mrmppro's updated fork. It was further updated by me to support standalone antigravity ide of version Antigravity IDE Version: 2.5.5 for personal use on windows x64 machine.
 ---
 
 ## Table of Contents
