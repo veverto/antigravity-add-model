@@ -14,10 +14,8 @@ Thumbs.db
 # Development artifacts
 scratch/
 
-# Compiled binary mocks
-dist/__mocks__/
-dist/*.test.js
-dist/**/*.test.js
+# Build artifacts
+dist/
 
 # Local Antigravity configuration (never commit credentials or routing policy)
 custom_models.json

@@ -84,7 +84,7 @@ function generateModelPlaceholderId(model: CustomModel): string {
     hash = (hash << 5) + hash + input.charCodeAt(i);
     hash = hash & hash; // Force 32-bit integer
   }
-  const placeholderNum = 400 + (Math.abs(hash) % 200);
+  const placeholderNum = 1 + (Math.abs(hash) % 350);
   return `MODEL_PLACEHOLDER_M${placeholderNum}`;
 }
 
@@ -174,12 +174,14 @@ function isModelMatch(m: CustomModel, targetModel: string | undefined, targetId?
   const cleanName = m.name.replace(/^models\//, '').toLowerCase();
   const slug = toSlug(m).toLowerCase();
   const enumName = generateModelPlaceholderId(m).toLowerCase();
+  const enumInt = parseInt(generateModelPlaceholderId(m).split('_M')[1], 10).toString();
 
   return (
     cleanName === cleanTarget ||
     slug === cleanTarget ||
     enumName === cleanTarget ||
-    (cleanTargetId !== '' && (cleanName === cleanTargetId || slug === cleanTargetId || enumName === cleanTargetId))
+    enumInt === cleanTarget ||
+    (cleanTargetId !== '' && (cleanName === cleanTargetId || slug === cleanTargetId || enumName === cleanTargetId || enumInt === cleanTargetId))
   );
 }
 
@@ -799,23 +801,7 @@ function handleCustomModelRequest(
 
   request.setTimeout(REQUEST_TIMEOUT_MS, () => {
     log.error(`[Proxy] Request timeout (${REQUEST_TIMEOUT_MS}ms) for ${model.name}`);
-    request.destroy();
-
-    if (retryCount < MAX_RETRIES) {
-      log.warn(`[Proxy] Timeout for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-      setTimeout(
-        () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
-        1000 * (retryCount + 1),
-      );
-      return;
-    }
-
-    if (handOverToFallback(`timeout after ${REQUEST_TIMEOUT_MS / 1000}s`)) return;
-
-    if (!res.headersSent) {
-      res.writeHead(504, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Request timeout after ${REQUEST_TIMEOUT_MS / 1000}s` } }));
-    }
+    request.destroy(new Error(`Request timeout after ${REQUEST_TIMEOUT_MS / 1000}s`));
   });
 
   request.on('error', (err) => {
@@ -1242,7 +1228,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                 displayName: m.displayName,
                 maxTokens: 1048576,
                 maxOutputTokens: 4096,
-                model: placeholder,
+                model: generateModelPlaceholderId(m),
                 apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                 modelProvider: 'MODEL_PROVIDER_GOOGLE',
               };
@@ -1275,10 +1261,11 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                   return {
                     name: 'models/' + generateModelPlaceholderId(m),
                     version: '1.0',
-                    displayName: m.displayName,
+                    displayName: m.displayName || m.name || 'Custom Model',
                     description: m.description,
                     inputTokenLimit: cap.maxTokens,
                     outputTokenLimit: cap.maxOutputTokens,
+                    model: generateModelPlaceholderId(m),
                     supportedGenerationMethods: ['generateContent', 'countTokens'],
                     temperature: cap.isThinking ? undefined : 0.7,
                     topP: cap.isThinking ? undefined : 0.9,
@@ -1294,19 +1281,17 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                   const slug = toSlug(m);
                   const cap = detectModelCapabilities(m, true);
                   const entry: Record<string, unknown> = {
-                    displayName: m.displayName,
+                    displayName: m.displayName || m.name || 'Custom Model',
                     supportsImages: cap.supportsImages,
                     supportsThinking: cap.isThinking,
                     recommended: true,
                     maxTokens: cap.maxTokens,
                     maxOutputTokens: cap.maxOutputTokens,
-                    tokenizerType: 'LLAMA_WITH_SPECIAL',
                     model: generateModelPlaceholderId(m),
                     apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                     modelProvider: 'MODEL_PROVIDER_GOOGLE',
                   };
                   if (cap.supportsImages) {
-                    entry.supportsVideo = false;
                     entry.supportedMimeTypes = {
                       'image/png': true,
                       'image/jpeg': true,
@@ -1314,34 +1299,6 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                       'image/gif': true,
                       'image/heic': true,
                       'image/heif': true,
-                      'text/plain': true,
-                      'text/markdown': true,
-                      'text/html': true,
-                      'text/css': true,
-                      'text/xml': true,
-                      'text/csv': true,
-                      'application/json': true,
-                      'application/pdf': true,
-                      'application/x-javascript': true,
-                      'application/x-typescript': true,
-                      'application/x-python-code': true,
-                      'application/x-ipynb+json': true,
-                    };
-                  } else {
-                    entry.supportsVideo = false;
-                    entry.supportedMimeTypes = {
-                      'text/plain': true,
-                      'text/markdown': true,
-                      'text/html': true,
-                      'text/css': true,
-                      'text/xml': true,
-                      'text/csv': true,
-                      'application/json': true,
-                      'application/pdf': true,
-                      'application/x-javascript': true,
-                      'application/x-typescript': true,
-                      'application/x-python-code': true,
-                      'application/x-ipynb+json': true,
                     };
                   }
                   const placeholderId = generateModelPlaceholderId(m);
@@ -1412,7 +1369,6 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             const customModelIds: string[] = [];
             customModels.forEach((m) => {
               customModelIds.push(toSlug(m));
-              customModelIds.push(generateModelPlaceholderId(m));
             });
 
             if (customModelIds.length > 0) {
@@ -1434,6 +1390,11 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               log.info(`[Proxy] Injected ${customModelIds.length} custom model IDs into agentModelSorts`);
             }
 
+            try {
+              require('fs').writeFileSync(require('path').join(require('os').homedir(), '.gemini', 'antigravity', 'fetch_response.json'), JSON.stringify(googleJson, null, 2));
+            } catch (e) {
+              log.error('[Proxy] Failed to write fetch_response.json', e);
+            }
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(googleJson));
           } catch (err) {

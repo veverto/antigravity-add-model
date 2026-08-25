@@ -29,7 +29,7 @@ function generateModelPlaceholderId(model: { displayName?: string; name?: string
     hash = (hash << 5) + hash + input.charCodeAt(i);
     hash = hash & hash; // Force 32-bit integer
   }
-  const placeholderNum = 400 + (Math.abs(hash) % 200);
+  const placeholderNum = 1 + (Math.abs(hash) % 350);
   return `MODEL_PLACEHOLDER_M${placeholderNum}`;
 }
 
@@ -105,11 +105,11 @@ describe('generateModelPlaceholderId', () => {
     expect(id).toBeTruthy();
   });
 
-  it('placeholder number is within range [400, 599]', () => {
+  it('placeholder number is within range [1, 350]', () => {
     const id = generateModelPlaceholderId({ name: 'gpt-4o' });
     const num = parseInt(id.replace('MODEL_PLACEHOLDER_M', ''), 10);
-    expect(num).toBeGreaterThanOrEqual(400);
-    expect(num).toBeLessThanOrEqual(599);
+    expect(num).toBeGreaterThanOrEqual(1);
+    expect(num).toBeLessThanOrEqual(350);
   });
 
   it('lowercases the input before hashing', () => {

@@ -1,512 +1,205 @@
-# Antigravity Custom Model Enabler
+# Antigravity IDE Custom Model Enabler
 
-> **Unofficial compatibility patch.** This independent project is not affiliated
-> with, endorsed by, or supported by Google. “Google” and “Antigravity” are used
-> only to describe compatible products; their respective trademark owners retain
-> all rights.
+> **Unofficial compatibility patch.** This independent project is not affiliated with, endorsed by, or supported by Google. "Google", "Antigravity", and "Cloud Code" are used only to describe compatible products; their respective trademark owners retain all rights.
 
-This repository contains a patch for **Google Antigravity** that enables external AI models (OpenAI, Anthropic, Together API, Ollama, Google AI Studio, and any OpenAI-compatible provider) alongside the built-in Gemini models. It injects a local HTTP proxy into the Electron app, reverse-engineers the Cloud Code internal API (`v1internal`), translates request/response formats between providers, and provides an inline "Add Model" UI in the Settings page.
+This repository provides a self-sufficient local proxy and patcher for **Antigravity IDE** (`Antigravity IDE.exe`). It enables external AI models (OpenAI, Anthropic Claude, Moonshot / Kimi, Together AI, OpenRouter, Ollama, Google AI Studio, Groq, Mistral, and any OpenAI-compatible provider) to appear and function inside the Antigravity IDE chat dropdown with full support for streaming, function calling, and tool usage.
 
-## Gravity Auto Switch — use your API budget deliberately
+---
 
-**Gravity Auto Switch** is an opt-in router for the custom models you add and
-verify. It can send routine requests to a lower-cost model while reserving your
-stronger models for complex or protected work. This can reduce spending on your
-own API accounts, but savings depend on your providers, model prices, prompt
-mix, and the tiers you choose.
+## Table of Contents
 
-You stay in control:
+- [Stock Antigravity IDE Architecture (Out-of-the-Box)](#stock-antigravity-ide-architecture-out-of-the-box)
+- [Patched Architecture & Interception Flow (How Our Patch Works)](#patched-architecture--interception-flow-how-our-patch-works)
+- [Quick Start & Deployment](#quick-start--deployment)
+- [Supported AI Providers & Models](#supported-ai-providers--models)
+- [Model Configuration (`custom_models.json`)](#model-configuration-custom_modelsjson)
+- [Gravity Auto Switch](#gravity-auto-switch)
+- [Security & API Key Encryption](#security--api-key-encryption)
+- [Troubleshooting & FAQs](#troubleshooting--faqs)
+- [Developer Guide](#developer-guide)
+- [License & Attribution](#license--attribution)
 
-- Assign every verified custom model to **Cheap**, **Mid-priced**, or
-  **Strong**, then order it as **Primary** or a **Fallback** in that tier.
-- Choose a spending mode: **Budget friendly**, **Balanced**, or **Max
-  performance**. Auto Switch selects from your configured tiers; it does not
-  invent providers or change their prices.
-- Keep a chat in **Manual** mode whenever you want the model you selected to be
-  used exactly as-is. **Google models are never modified or rerouted.**
-- Protected work—such as tool use, function results, attachments, credentials,
-  deployment-related requests, or destructive-operation language—uses the
-  Strong → Mid-priced chain. A route must have its required capabilities
-  verified before it is eligible.
-- When a primary route fails before it produces a response, the configured
-  fallbacks are tried in order. Re-verifying a model refreshes its capabilities
-  without overwriting your tier, priority, or enabled choice.
+---
 
-### Quick start
+## Stock Antigravity IDE Architecture (Out-of-the-Box)
 
-1. Add your API models in **Settings → Models → Custom Models**.
-2. Press **Verify** for each model you want Auto Switch to use.
-3. In **Gravity Auto Switch**, choose each model’s **Use for** tier and set
-   **Primary/Fallback** order with the arrow controls.
-4. Select a spending mode, turn Auto Switch on, then choose **Auto** in the
-   chat mode control.
-5. Check the local log for `tier=` and `priority=` to confirm the selected
-   route.
-
-> [!NOTE]
-> Image/attachment support is deliberately conservative: a model must first
-> prove that capability during verification. Until then, an attachment request
-> is left on the manually selected model instead of being sent to an unproven
-> route. See the detailed [Gravity Auto Switch guide](docs/gravity-auto-switch.md).
-
-## How It Works
-
-### Architecture
+In its pristine, unpatched state, Antigravity IDE (`%LOCALAPPDATA%\Programs\Antigravity IDE\resources\app`) is designed as a closed Google-only ecosystem:
 
 ```
-Antigravity IDE
-  └── Language Server (Go binary)
-        └── --api_server_url → http://127.0.0.1:50999 (local proxy)
-                                  ├── Google models → daily-cloudcode-pa.googleapis.com
-                                  └── Custom models → external API (Together, OpenAI, etc.)
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                               STOCK ANTIGRAVITY IDE                                     │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. Chromium Renderer (out/vs/workbench/workbench.desktop.main.js)                 │  │
+│  │    • DQo() only groups Google-provided model labels.                              │  │
+│  │    • wqt() & Goe() validate selection against stock visibleModelConfigs.          │  │
+│  │    • If a selected model is unrecognized, !RTn(d, y) resets it to Gemini Flash.  │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+│                                           │ IPC State Sync                              │
+│  ┌────────────────────────────────────────▼──────────────────────────────────────────┐  │
+│  │ 2. Electron Main Process (out/main.js)                                            │  │
+│  │    • Defines Google Cloud Code URLs (Uis="https://daily-cloudcode-pa...", etc.)   │  │
+│  │    • Spawns Language Server binary with default flags                             │  │
+│  │    • Broadcasts Google endpoint to Language Server via gRPC (SetCloudCodeURL)     │  │
+│  │    • Normalizes only Google model IDs in r2l()                                    │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+│                                           │ gRPC / CLI                                  │
+│  ┌────────────────────────────────────────▼──────────────────────────────────────────┐  │
+│  │ 3. Go Language Server Binary (language_server_windows_x64.exe)                    │  │
+│  │    • Hardcoded fallback URLs point directly to Google Cloud Code servers.         │  │
+│  │    • Connects directly to Google over HTTPS (Port 443).                           │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+└───────────────────────────────────────────┼─────────────────────────────────────────────┘
+                                            │ Direct HTTPS (Port 443)
+                                            ▼
+                    ┌─────────────────────────────────────────────────┐
+                    │            Google Cloud Code Servers            │
+                    │      https://daily-cloudcode-pa.googleapis.com  │
+                    │      https://cloudcode-pa.googleapis.com        │
+                    │                                                 │
+                    │   Rejects any non-Google custom model slugs     │
+                    │   with TCP socket drops (WSAECONNRESET).        │
+                    └─────────────────────────────────────────────────┘
 ```
 
-### Key Components
+### Why Stock Fails with Custom Models:
+1. **Direct Google TLS Connection**: The Language Server binary sends generation requests (`streamGenerateContent`) directly to `https://daily-cloudcode-pa.googleapis.com` or `https://cloudcode-pa.googleapis.com` over HTTPS port 443. Google's servers reject custom model slugs (`custom-moonshotai-kimi-k3`, etc.) with `Unknown: Agent execution terminated due to error` and close the TCP connection.
+2. **Dynamic Runtime gRPC Reversion**: Even if `--cloud_code_endpoint` is passed at startup, `out/main.js` calls `SetCloudCodeURL` via gRPC at runtime with `https://daily-cloudcode-pa.googleapis.com`, overriding the endpoint back to Google.
+3. **Strict UI State Validation**: The Cascade state manager in `workbench.desktop.main.js` (`wqt()`) resets any model not present in `visibleModelConfigs` back to the default Gemini Flash.
 
-#### Proxy Core
-| File | Role |
-|---|---|
-| [proxy.ts](src/proxy.ts) | Local HTTP proxy: intercepts Cloud Code API, merges custom models, translates provider formats, wraps responses |
-| [registry.ts](src/proxy/registry.ts) | Auto-discovery translator registry that dynamically loads `openai`, `anthropic`, `google`, and `ollama` translators |
-| [shared.ts](src/proxy/shared.ts) | Cross-turn state management with automatic TTL cleanup |
-| [modelUtils.ts](src/proxy/modelUtils.ts) | Centralized model capability detection (thinking, DeepSeek, Claude) |
+---
 
-#### Format Translators
-| File | Role |
-|---|---|
-| [openai.ts](src/proxy/translators/openai.ts) | OpenAI ↔ Gemini format translation (request, response, streaming chunks, tool calls) |
-| [anthropic.ts](src/proxy/translators/anthropic.ts) | Anthropic ↔ Gemini format translation (Claude tool_use, SSE streaming, thinking support) |
-| [google.ts](src/proxy/translators/google.ts) | Google AI Studio passthrough with streaming endpoint routing |
-| [ollama.ts](src/proxy/translators/ollama.ts) | Ollama ↔ Gemini format translation (OpenAI-compatible local LLMs) |
-| [utils.ts](src/proxy/translators/utils.ts) | Shared translator utilities (tool call mapping, DSML parsing, parameter type fixing) |
+## Patched Architecture & Interception Flow (How Our Patch Works)
 
-#### Security & Data
-| File | Role |
-|---|---|
-| [cryptoStore.ts](src/cryptoStore.ts) | AES-256-GCM API key encryption via Electron `safeStorage` |
-| [schemaValidator.ts](src/schemaValidator.ts) | Runtime schema validation for API responses, custom models, and streaming chunks |
-
-#### UI & App Integration
-| File | Role |
-|---|---|
-| [preload.ts](src/preload.ts) | UI injection: Custom Models dashboard in Settings → Models, inline Add Model modal with animations, connectivity test button |
-| [main.ts](src/main.ts) | App lifecycle: intercepts and blocks `SetCloudCodeURL` requests to prevent the frontend from overriding the proxy endpoint |
-| [ipcHandlers.ts](src/ipcHandlers.ts) | Backend IPC: `storage:get-custom-models`, `storage:save-custom-model`, `storage:delete-custom-model`, `storage:test-model-connection` |
-| [autoSwitch/](src/autoSwitch) | Opt-in Gravity Auto policy validation and rule-based routing for a dedicated `Gravity Auto` model-picker entry; see [Gravity Auto Switch](docs/gravity-auto-switch.md) |
-| [languageServer.ts](src/languageServer.ts) | Modified language server manager, starts proxy on app launch |
-
-#### Deployment Scripts
-| File | Platform |
-|---|---|
-| [deploy.ps1](deploy.ps1) | Windows — stops Antigravity, packs `dist/` into `app.asar`, restarts |
-| [deploy.sh](deploy.sh) | macOS — extracts `app.asar` from `/Applications/`, replaces `dist/`, repacks and relaunches |
-| [deploy_linux.sh](deploy_linux.sh) | Linux — auto-detects installation path across standard Electron app directories |
-| [repack.ps1](repack.ps1) | Repacks existing `app.asar` with updated `dist/` files |
-
-> [!NOTE]
-> The codebase was migrated from JavaScript (`dist/`) to **TypeScript** (`src/`) in v2.0.3. All source code lives under `src/` and compiles to `dist/` via `npx tsc`. The compiled `dist/` files are what get packed into `app.asar`.
-
-### Cloud Code API Reverse Engineering
-
-Antigravity uses Google's **Cloud Code internal API** (`v1internal:*` endpoints) instead of the public Gemini API. The proxy handles these differences:
-
-1. **fetchAvailableModels**: Intercepts and injects custom model definitions. Custom model slugs are added to `agentModelSorts` so they appear in the chat model dropdown. Quota info is omitted for custom models since they use the user's own API key.
-
-2. **streamGenerateContent/generateContent**: Cloud Code wraps the Gemini request inside a `request` field:
-   ```json
-   {
-     "project": "...",
-     "requestId": "...",
-     "request": { "contents": [...], "systemInstruction": {...}, "generationConfig": {...} },
-     "model": "custom-deepseek-ai-deepseek-v4-pro"
-   }
-   ```
-   The proxy extracts `request` before format translation.
-
-3. **systemInstruction**: Cloud Code sends model identity/tool definitions in a separate `systemInstruction` field (not inside `contents`). The proxy maps this to OpenAI's `role: "system"` or Anthropic's `system` parameter.
-
-4. **Response envelope**: Cloud Code wraps responses in `{"response": {...}, "traceId": "...", "metadata": {}}`. The proxy mirrors this format so the IDE accepts the response.
-
-### Request/Response Flow
+Our patch transforms Antigravity IDE into an open, multi-provider development environment by injecting a self-sufficient local proxy and coordinating modifications across all three layers:
 
 ```
-1. User selects custom model and sends message
-2. IDE → POST /v1internal:streamGenerateContent?alt=sse → local proxy
-3. Proxy detects custom model match (by slug or hash-based MODEL_PLACEHOLDER_* ID)
-4. Extracts reqJson.request → maps systemInstruction + contents to provider format
-5. POST to external API (e.g. https://api.together.xyz/v1/chat/completions)
-6. Maps external response back to Gemini format
-7. Wraps in Cloud Code envelope {"response": {...}, "traceId": "", "metadata": {}}
-8. Returns SSE: data: {envelope}\n\n → IDE displays response
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PATCHED ANTIGRAVITY IDE                                    │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ 1. Chromium Renderer (out/vs/workbench/workbench.desktop.main.js)                 │  │
+│  │    • [PATCHED] DQo() injects custom models into Recommended dropdown list.        │  │
+│  │    • [PATCHED] wqt() & Goe() include custom models in visibleModelConfigs (y).    │  │
+│  │    • [PATCHED] POu panel expanded to max-h-[580px] to prevent submenu clipping.   │  │
+│  │    • [PRESERVED] Thinking / effort submenus (High/Medium/Low) for Gemini models.  │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+│                                           │ IPC State Sync                              │
+│  ┌────────────────────────────────────────▼──────────────────────────────────────────┐  │
+│  │ 2. Electron Main Process (out/main.js)                                            │  │
+│  │    • [INJECTED] Self-Sufficient HTTP Proxy Server booting on port 50999.          │  │
+│  │    • [PRESERVED] Google Cloud Code URL constants & OAuth flow left untouched.     │  │
+│  │    • [PATCHED] Kos passes --cloud_code_endpoint http://127.0.0.1:50999 to LS      │  │
+│  │    • [PATCHED] setCloudCodeURL gRPC calls locked to http://127.0.0.1:50999        │  │
+│  │      (both startup and updateLSCloudCodeUrl runtime updates)                      │  │
+│  │    • [PATCHED] r2l() registers custom model dictionary & sorts into state         │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+│                                           │ gRPC / CLI Flags                            │
+│  ┌────────────────────────────────────────▼──────────────────────────────────────────┐  │
+│  │ 3. Go Language Server Binary (language_server_windows_x64.exe)                    │  │
+│  │    • [BYTE-PATCHED] daily-cloudcode-pa... (41B) ──► localhost:50999/v1internal/xxx│  │
+│  │    • [BYTE-PATCHED] cloudcode-pa...       (35B) ──► localhost:50999/v1internal/x  │  │
+│  └────────────────────────────────────────┬──────────────────────────────────────────┘  │
+└───────────────────────────────────────────┼─────────────────────────────────────────────┘
+                                            │ All Traffic Rerouted to Local Proxy
+                                            ▼
+                    ┌─────────────────────────────────────────────────┐
+                    │          MRMPPRO Local Proxy (Port 50999)       │
+                    │                                                 │
+                    │  ├── Custom Models ──► External APIs            │
+                    │  │   (OpenAI, Anthropic, Kimi, Ollama, etc.)    │
+                    │  │   • Translates request & SSE stream format   │
+                    │  │   • Emulates Cloud Code envelope             │
+                    │  │                                              │
+                    │  └── Native Models ──► Google Cloud Code        │
+                    │      (Gemini 3.7 Flash, Gemini 3.1 Pro, etc.)   │
+                    └─────────────────────────────────────────────────┘
 ```
 
-### Streaming Fix (Critical)
+### The 4 Patching Layers Explained:
 
-The proxy differentiates between **metadata requests** (which need buffering for URL rewriting) and **generation requests** (which must be streamed directly). If the proxy buffers `streamGenerateContent` or `generateContent` responses, the Go language server times out waiting for the stream to end, causing the app to crash with "terminated due to error."
+1. **Dual-Endpoint Binary Patching (`language_server_windows_x64.exe`)**:
+   Replaces both hardcoded Google URLs byte-for-byte in the compiled binary so all requests hit our local proxy on port 50999:
+   - `https://daily-cloudcode-pa.googleapis.com` (41 bytes) $\rightarrow$ `http://localhost:50999/v1internal/xxxxxxx`
+   - `https://cloudcode-pa.googleapis.com` (35 bytes) $\rightarrow$ `http://localhost:50999/v1internal/x`
 
-- **Metadata requests** (`v1internal:*` excluding generation): Buffered, decompressed, URL-rewritten to point back to local proxy
-- **Generation requests** (`streamGenerateContent`, `generateContent`): Piped directly without buffering, preserving real-time streaming
+2. **Main Process Hook & Proxy Startup (`out/main.js`)**:
+   - Spawns the local proxy from `out/mrmppro-proxy/proxy.js` on port `50999`.
+   - Preserves Google OAuth URL constants (`Zis`, `Dis`, `Uis`, `Gis`) to keep sign-in working.
+   - Injects `--cloud_code_endpoint http://127.0.0.1:50999` in `Kos`.
+   - Locks both `setCloudCodeURL` gRPC calls (startup and `updateLSCloudCodeUrl`) to `http://127.0.0.1:50999`.
+   - Normalizes custom models in `r2l()` into `cascadeModelConfigData`.
 
-### SetCloudCodeURL Blocking
+3. **UI Dropdown & State Integration (`workbench.desktop.main.js`)**:
+   - Injects custom models into `DQo` so they appear in the chat model picker.
+   - Updates `visibleModelConfigs` (`y`) in `wqt()` and `Goe()` so custom selections are recognized as valid and retain their checkmark.
+   - Expands `model-selector-panel` (`POu`) to `max-h-[580px]` so flyout thinking/effort submenus (High/Medium/Low) for Gemini models are never clipped by CSS overflow containers.
 
-The Antigravity frontend periodically attempts to call `SetCloudCodeURL` which would override the local proxy endpoint with the default Google API URL. The `main.ts` process intercepts and **cancels** these requests via `webRequest.onBeforeRequest`, ensuring the language server always routes through the local proxy.
+4. **Checksum Synchronization (`product.json`)**:
+   - Recalculates SHA256 hashes for all modified bundles in `out/`, preventing "Installation Corrupted" warnings.
 
-### DSML Tool Call Parser
+---
 
-DeepSeek models (and some other providers) return tool calls in a custom **DSML** (DeepSeek Markup Language) format embedded in text content:
+## Quick Start & Deployment
 
-```xml
-<DSML|invoke name="search_web">
-  <DSML|parameter name="query" string="true">latest news</DSML|parameter>
-</DSML|invoke>
+1. Ensure Antigravity IDE is closed.
+2. From PowerShell in this repository folder, run:
+
+```powershell
+.\deploy-ide.ps1
 ```
 
-The proxy automatically detects DSML blocks, parses them into Gemini-format `functionCall` objects, and strips the XML from the displayed text. Native OpenAI `tool_calls` and Anthropic `tool_use` blocks are also supported.
+Or double-click **`repatch.bat`**.
 
-### Anthropic Tool Calling
+The deploy script will:
+- Terminate any running IDE or Language Server background processes cleanly.
+- Build the TypeScript proxy source (`npm run build`).
+- Copy proxy modules to `resources/app/out/mrmppro-proxy/`.
+- Execute [`patch-ide.js`](patch-ide.js) (UI bundle patch, main process hook, checksum sync).
+- Apply the dual-endpoint byte patch to `language_server_windows_x64.exe`.
+- Launch Antigravity IDE with custom models enabled.
 
-Claude models (`anthropic` provider) return tool calls as `tool_use` content blocks. The proxy maps these to Gemini-format `functionCall` parts, sets `finishReason: "TOOL_CALL"`, and stores tool call IDs for later matching with `functionResponse` objects in subsequent turns. Both streaming (SSE `content_block_start`/`content_block_delta`) and non-streaming responses are fully handled.
+---
 
-### Security: API Key Encryption
+## Supported AI Providers & Models
 
-All API keys are encrypted at rest using **AES-256-GCM** via Electron's `safeStorage`. The `cryptoStore.ts` module provides:
-
-- **Transparent encryption/decryption**: Keys are encrypted before writing to disk, decrypted on-the-fly when loaded into memory.
-- **Auto-migration**: On first run after the encryption update, any legacy plaintext `custom_models.json` config is automatically detected, encrypted, and rewritten.
-- **Masked display**: API keys in the UI are shown as `sk-...XXXX` (last 4 chars only) to prevent shoulder-surfing.
-- **OS-level key storage**: On macOS, `safeStorage` uses the Keychain; on Windows, it uses DPAPI.
-
-### Dynamic Port Management
-
-The local proxy uses **dynamic port allocation** with automatic fallback:
-
-```typescript
-// proxy.ts → startProxy()
-server.listen(50999, ...);  // Try default port
-server.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
-    server.listen(0, ...);  // Fallback: let OS pick a free port
-  }
-});
-```
-
-If the default port `50999` is already in use (e.g., by another instance or stale process), the proxy automatically falls back to a random available port (`port: 0`). The `languageServer.ts` module reads the dynamically assigned port and injects it into the Go language server's `--api_server_url` argument at startup, ensuring the chain always stays connected.
-
-### Parallel Request Isolation
-
-Multiple models can now make simultaneous requests without cross-contamination. Previously, global variables like `lastToolCallIds` and `lastReasoningContent` could be overwritten by concurrent requests from different models. These have been migrated to **per-model `Map` structures**:
-
-- `modelToolCallIds` (`Map<modelName, { fnName: toolCallId }>`) keeps tool call ID tracking scoped per model
-- `modelReasoningContent` (`Map<modelName, string>`) keeps DeepSeek reasoning state scoped per model
-- `activeStreamContexts` (`Map<streamId, context>`) keeps streaming accumulator scoped per stream
-
-### Automatic State Cleanup
-
-Proxy state is automatically cleaned up via a managed garbage collection interval:
-- **Stream contexts**: TTL 10 minutes
-- **Tool call IDs & reasoning**: TTL 30 minutes
-- Interval starts with `startProxy()` and stops with `stopProxy()`, preventing orphaned timers
-
-### Schema Validation
-
-The `schemaValidator.ts` module provides runtime validation to catch malformed API responses before they reach the IDE frontend, preventing cryptic errors. Exported validators include:
-
-| Function | Validates |
-|---|---|
-| `validateCandidate` | Individual Gemini candidate structure |
-| `validateGenerateContentResponse` | Full Gemini response payload |
-| `validateCloudCodeEnvelope` | Cloud Code `{ response, traceId, metadata }` wrapper |
-| `validateCustomModel` | Single custom model config (provider enum, URL format) |
-| `validateCustomModels` | Array of custom model configs |
-| `validateGenerateContentRequest` | Request body structure |
-| `validateOpenAiChunk` | OpenAI streaming chunk |
-| `validateAnthropicEvent` | Anthropic SSE event type |
-
-### Model Connectivity Test
-
-Each custom model in Settings has a **"Test Connection"** button that sends a lightweight request to the model's API endpoint:
-
-- Quick connectivity check (10-second timeout)
-- Green ✅ or red ❌ status indicator
-- Helpful error messages for common issues (auth, timeout, SSL)
-- Implemented via IPC: `storage:test-model-connection`
-
-### Request Retry & Rate Limiting
-
-The proxy automatically retries failed requests with exponential backoff:
-
-- **Triggers**: 429 (Rate Limit), 502, 503, 504 (Server Errors)
-- **Backoff**: 1s → 2s → 4s → 8s (max 3 retries)
-- **Retry-After**: Respects server-sent `Retry-After` header
-- **Configurable**: `maxRetries` field in model config (default: 3)
-
-## Repository Structure
-
-```
-antigravity-add-model/
-├── src/
-│   ├── proxy.ts                   # HTTP proxy + Cloud Code interceptor + format translation
-│   ├── proxy/
-│   │   ├── registry.ts            # Auto-discovery translator registry
-│   │   ├── shared.ts              # Cross-turn state management + TTL cleanup
-│   │   ├── modelUtils.ts          # Centralized model capability detection
-│   │   └── translators/
-│   │       ├── openai.ts          # OpenAI ↔ Gemini translator
-│   │       ├── anthropic.ts       # Anthropic ↔ Gemini translator
-│   │       ├── google.ts          # Google AI Studio passthrough + stream routing
-│   │       └── utils.ts           # Shared translator utilities (DSML, tool calls)
-│   ├── languageServer.ts          # Modified language server manager
-│   ├── ipcHandlers.ts             # Custom model CRUD + connectivity test IPC
-│   ├── cryptoStore.ts             # AES-256-GCM API key encryption/decryption
-│   ├── schemaValidator.ts         # Runtime schema validation for responses & models
-│   ├── preload.ts                 # Settings UI injection (inline Add Model dashboard)
-│   ├── main.ts                    # App lifecycle + SetCloudCodeURL blocking
-│   ├── constants.ts               # Port & cert constants
-│   ├── paths.ts                   # Path utilities
-│   ├── storage.ts                 # StorageManager class
-│   ├── menu.ts                    # Application menu
-│   ├── tray.ts                    # System tray
-│   ├── updater.ts                 # Auto-updater
-│   ├── customScheme.ts            # Plugin scheme handler
-│   ├── keybindings.ts             # Keyboard shortcuts
-│   ├── loadingOverlay.ts          # Loading screen overlay
-│   ├── types.ts                   # Type definitions
-│   ├── utils.ts                   # Window management & utilities
-│   ├── services/
-│   │   └── settingsService.ts
-│   ├── ideInstall/                # IDE installation wizard
-│   ├── __tests__/                  # Unit tests (vitest)
-│   │   ├── registry.test.ts
-│   │   ├── proxy.test.ts
-│   │   ├── modelUtils.test.ts
-│   │   ├── anthropic.test.ts
-│   │   ├── openai.test.ts
-│   │   └── utils.test.ts
-│   ├── __mocks__/                 # Test mocks
-├── dist/                          # Compiled JavaScript output
-├── tsconfig.json                  # TypeScript configuration
-├── deploy.ps1                     # Portable PowerShell deploy script
-├── repack.ps1                     # ASAR repack script
-├── package.json                   # Electron app manifest
-└── README.md
-```
-
-## Supported Providers
-
-You can configure **multiple models from different providers simultaneously**. All of them will appear together in the model selection dropdown in the Antigravity chat interface, and you can switch between them in real-time.
-
-<p align="center">
-  <img src="assets/chat_model_dropdown.png" alt="Model Selection Dropdown" width="600">
-</p>
-
-| Provider | Format | Environment Variable / Key | Default API URL |
+| Provider | `provider` Key | Protocol / Format | Features |
 |---|---|---|---|
-| **OpenAI** | `openai` | `apiKey` (or `OPENAI_API_KEY`) | `https://api.openai.com/v1/chat/completions` |
-| **Anthropic** | `anthropic` | `apiKey` (or `ANTHROPIC_API_KEY`) | `https://api.anthropic.com/v1/messages` |
-| **OpenRouter** | `openrouter` | `apiKey` (OpenRouter API Key) | `https://openrouter.ai/api/v1/chat/completions` |
-| **Ollama** (Local) | `ollama` | *(None required)* | `http://localhost:11434/v1/chat/completions` |
-| **Google AI Studio** | `google` | `apiKey` *(Gemini API Key)* | `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent` |
-| **DeepSeek** | `deepseek` | `apiKey` | `https://api.deepseek.com/anthropic` |
-| **Groq** | `groq` | `apiKey` | `https://api.groq.com/openai/v1` |
-| **Mistral** | `mistral` | `apiKey` | `https://api.mistral.ai/v1` |
-| **Cerebras** | `cerebras` | `apiKey` | `https://api.cerebras.ai/v1` |
-| **Kimi (Moonshot)** | `kimi` | `apiKey` | `https://api.moonshot.ai/anthropic/v1` |
-| **Fireworks AI** | `fireworks` | `apiKey` | `https://api.fireworks.ai/inference/v1` |
-| **LM Studio** (Local) | `lmstudio` | *(None required)* | `http://localhost:1234/v1` |
-| **llama.cpp** (Local) | `llamacpp` | *(None required)* | `http://localhost:8080/v1` |
-| **NVIDIA NIM** | `nvidia` | `apiKey` | `https://integrate.api.nvidia.com/v1` |
-| **Custom** (OpenAI-compatible) | `custom` | `apiKey` *(Provider API Key)* | Any OpenAI-compatible endpoint |
-
-> [!NOTE]
-> For the **Custom** provider, URLs ending in `/v1` automatically get `/chat/completions` appended. It is fully compatible with Together AI, OpenRouter, Groq, Mistral, and any other OpenAI-compliant endpoint.
-
-> [!NOTE]
-> **OpenRouter** provides unified access to 300+ models (OpenAI, Anthropic, Google, Meta, DeepSeek, etc.) through a single API. It uses the OpenAI-compatible format with Bearer token auth and optional `HTTP-Referer` / `X-Title` headers for ranking.
-
-> [!NOTE]
-> For **Google AI Studio**, provide the full endpoint URL or just the base `https://generativelanguage.googleapis.com/v1beta/models/`. The proxy auto-detects `streamGenerateContent` vs `generateContent` based on whether the request is streaming.
+| **Kimi (Moonshot AI)** | `kimi` / `anthropic` | Anthropic Messages or OpenAI Format | Tool use, long context, streaming |
+| **OpenAI** | `openai` | Chat Completions | GPT-4o, o1, o3-mini, function calling |
+| **Anthropic** | `anthropic` | Messages API (SSE) | Claude 3.5 Sonnet, Claude 3.7 Sonnet, Tool use |
+| **OpenRouter** | `openrouter` | OpenAI-compatible (Unified) | 300+ models with Bearer auth |
+| **Ollama (Local)** | `ollama` | Local HTTP API | Llama 3, DeepSeek, Mistral (Offline) |
+| **Google AI Studio** | `google` | Gemini REST API | Gemini 1.5/2.0/3.0 via AI Studio Key |
+| **DeepSeek** | `custom` / `deepseek` | OpenAI format + DSML | DeepSeek V3/R1 with embedded reasoning tags |
+| **Groq / Together / Mistral** | `custom` | OpenAI-compatible | High-speed inference providers |
+| **LM Studio / llama.cpp** | `custom` | Local OpenAI-compatible | Local hardware inference |
 
 ---
 
-## Installation
+## Model Configuration (`custom_models.json`)
 
-### One-Click Re-Deploy (After Antigravity Updates)
+Models are configured in your user profile directory:
+- **Path**: `~/.gemini/antigravity/custom_models.json` (e.g. `C:\Users\<Username>\.gemini\antigravity\custom_models.json`)
 
-When Google releases a new Antigravity version, the update replaces the Language Server binary and custom models stop working. Simply run:
-
-```
-repatch.bat
-```
-
-Or double-click `repatch.bat` in the project folder. This rebuilds, redeploys the patch, and restarts Antigravity in one step.
-
-> [!IMPORTANT]
-> Run `repatch.bat` after **every** Antigravity auto-update to restore custom model support.
-
-### Automatic (Windows)
-
-```powershell
-.\deploy.ps1
-```
-
-This stops Antigravity, packs the project's `dist/` into `app.asar`, deploys to `%LOCALAPPDATA%\Programs\antigravity\resources\`, and restarts the app.
-
-> [!TIP]
-> The deploy script uses `$PSScriptRoot` (script's own directory). You can run it from anywhere; it always finds the project.
-
-### Automatic (macOS)
-
-```bash
-bash deploy.sh
-```
-
-This kills any running Antigravity process, extracts the current `app.asar` from `/Applications/Antigravity.app/Contents/Resources/`, replaces its `dist/` with the latest build, re-packages, and relaunches the app.
-
-> [!TIP]
-> Make the script executable first: `chmod +x deploy.sh`. Like the Windows version, it auto-detects the project directory via `$SCRIPT_DIR`.
-
-### Automatic (Linux)
-
-```bash
-bash deploy_linux.sh
-```
-
-Stops any running Antigravity process, auto-detects the `app.asar` location (common search paths: `~/.local/share/Programs/`, `/opt/`, `/usr/lib/`), replaces its `dist/` with the latest build, re-packages, and relaunches the app.
-
-> [!TIP]
-> Make the script executable first: `chmod +x deploy_linux.sh`. It automatically searches for the Antigravity installation across multiple standard Linux Electron app paths.
-
-### Build from Source (TypeScript)
-
-```bash
-npm install
-npx tsc
-```
-
-### Manual (All Platforms)
-
-```bash
-npx -y @electron/asar pack . "<antigravity_resources_dir>/app.asar"
-```
-
-- **Windows**: `C:\Users\<User>\AppData\Local\Programs\antigravity\resources\`
-- **macOS**: `/Applications/Antigravity.app/Contents/Resources/`
-
----
-
-## Antigravity Update Recovery
-
-### The Problem
-
-Starting with **Antigravity v2.0.6**, Google hardcoded the `fetchAvailableModels` API URL to `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` inside the Language Server binary. This call **bypasses the local proxy entirely**, meaning:
-
-- Custom models remain in `custom_models.json` and appear in **Settings → Custom Models**
-- But they **do NOT appear** in the chat model dropdown
-- The chat dropdown only shows Google's built-in Gemini models
-
-### The Fix: Binary Patch
-
-The `deploy.ps1` / `deploy.sh` / `deploy_linux.sh` scripts **automatically apply a binary patch** to the Language Server executable. The hardcoded URL:
-
-```
-https://daily-cloudcode-pa.googleapis.com
-```
-
-is replaced with:
-
-```
-http://localhost:50999/v1internal/xxxxxxx
-```
-
-This forces the Language Server to route **all** `fetchAvailableModels` calls through the local proxy, where custom models are injected before the response reaches the Antigravity frontend.
-
-### After EVERY Antigravity Update
-
-When Google releases a new Antigravity version (e.g., v2.0.7, v2.1.0):
-
-1. **Antigravity auto-updates** → The Language Server binary is replaced with an unpatched version
-2. **Custom models disappear** from the chat dropdown again
-3. **Re-run the deploy script** to re-apply the binary patch:
-
-```powershell
-# Windows (PowerShell)
-npm run build
-powershell -ExecutionPolicy Bypass -File ".\deploy.ps1"
-```
-
-```bash
-# macOS / Linux
-npm run build
-bash deploy.sh        # macOS
-bash deploy_linux.sh  # Linux
-```
-
-> [!IMPORTANT]
-> **You must redeploy after every Antigravity update.** The update replaces `language_server.exe` with a clean version, removing the binary patch. Running `deploy.ps1` re-applies the patch automatically.
-
-### How to Check if the Patch is Active
-
-Check the Language Server log after startup:
-
-```
-# Windows
-%APPDATA%\Antigravity\logs\language_server.log
-```
-
-If the patch is active, you'll see:
-```
-URL: http://localhost:50999/v1internal/xxxxxxx/v1internal:fetchAvailableModels
-```
-
-If the patch is NOT active (after an update), you'll see:
-```
-URL: https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels
-```
-
-### Technical Details
-
-The binary patch works by:
-
-1. **Finding** the string `https://daily-cloudcode-pa.googleapis.com` (41 bytes) in the LS binary
-2. **Replacing** it with `http://localhost:50999/v1internal/xxxxxxx` (exactly 41 bytes)
-3. **URL cleanup**: The proxy strips the `/v1internal/xxxxxxx` padding from incoming requests before forwarding to Google
-
-The patch also affects other hardcoded Cloud Code calls (`listExperiments`, `streamGenerateContent`, `loadCodeAssist`), routing them all through the proxy for consistent behavior.
-
-### Manual Binary Patch (if deploy script fails)
-
-```powershell
-# Find the offset of the hardcoded URL
-$offset = (Select-String -Path "language_server.exe" -Pattern "daily-cloudcode-pa.googleapis.com" -Encoding byte).Matches[0].Index - 8
-
-# Apply the patch
-$newUrl = [System.Text.Encoding]::ASCII.GetBytes("http://localhost:50999/v1internal/xxxxxxx")
-$fs = [System.IO.File]::OpenWrite("language_server.exe")
-$fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
-$fs.Write($newUrl, 0, $newUrl.Length)
-$fs.Close()
-```
-
-> [!NOTE]
-> The script above finds the `https://` prefix (8 bytes before the hostname) and replaces the full 41-byte URL. The `xxxxxxx` padding ensures the replacement stays exactly the same length as the original string.
->
-> A backup of the original binary is automatically created at `language_server.exe.bak` before patching.
-
----
-
-## Configuration
-
-Models are stored in your home directory at `~/.gemini/antigravity/custom_models.json`. You can easily add them via the **"Add Model"** modal in Settings, or edit the JSON file directly.
-
-Here is an example of a **fully loaded** `custom_models.json` file configuring **multiple models across all providers at the same time**:
+### Example Configuration:
 
 ```json
 {
   "models": [
     {
+      "name": "models/kimi-k3",
+      "displayName": "Kimi k3 (Moonshot)",
+      "description": "Moonshot AI Kimi model via proxy",
+      "provider": "kimi",
+      "apiKey": "sk-...",
+      "apiUrl": "https://api.moonshot.ai/anthropic/v1/messages",
+      "externalModelName": "kimi-k3"
+    },
+    {
       "name": "models/gpt-4o",
-      "displayName": "GPT-4o (OpenAI)",
-      "description": "OpenAI GPT-4o model via official API",
+      "displayName": "GPT-4o (OpenAI via Proxy)",
+      "description": "OpenAI GPT-4o model redirected through proxy",
       "provider": "openai",
       "apiKey": "sk-proj-...",
       "apiUrl": "https://api.openai.com/v1/chat/completions",
@@ -514,326 +207,89 @@ Here is an example of a **fully loaded** `custom_models.json` file configuring *
     },
     {
       "name": "models/claude-3-5-sonnet",
-      "displayName": "Claude 3.5 Sonnet",
-      "description": "Anthropic Claude 3.5 Sonnet via official API",
+      "displayName": "Claude 3.5 Sonnet (Anthropic)",
+      "description": "Anthropic Claude 3.5 Sonnet model",
       "provider": "anthropic",
       "apiKey": "sk-ant-...",
       "apiUrl": "https://api.anthropic.com/v1/messages",
       "externalModelName": "claude-3-5-sonnet-latest"
     },
     {
-      "name": "models/gemini-1.5-pro",
-      "displayName": "Gemini 1.5 Pro (AI Studio)",
-      "description": "Gemini 1.5 Pro via Google AI Studio Key",
-      "provider": "google",
-      "apiKey": "AIzaSy...",
-      "apiUrl": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
-      "externalModelName": "gemini-1.5-pro"
-    },
-    {
       "name": "models/llama3",
       "displayName": "Llama 3 (Local Ollama)",
-      "description": "Local Llama 3 model run on Ollama port 11434",
+      "description": "Local Llama 3 running on Ollama port 11434",
       "provider": "ollama",
       "apiKey": "",
       "apiUrl": "http://localhost:11434/v1/chat/completions",
       "externalModelName": "llama3"
-    },
-    {
-      "name": "models/deepseek-ai/deepseek-v4-pro",
-      "displayName": "DeepSeek V4 Pro (Together)",
-      "description": "DeepSeek V4 Pro via Together API",
-      "provider": "custom",
-      "apiKey": "YOUR_TOGETHER_API_KEY",
-      "apiUrl": "https://api.together.xyz/v1",
-      "externalModelName": "deepseek-ai/DeepSeek-V4-Pro",
-      "maxRetries": 3
     }
   ]
 }
 ```
 
-### Fields Explanation
+---
 
-| Field | Description |
-|---|---|
-| `name` | Internal model identifier (e.g. `models/gpt-4o`). Must start with `models/` prefix. |
-| `displayName` | The friendly name that will appear in the Antigravity chat model dropdown. |
-| `description` | Subtitle/description displayed in the Custom Models list in Settings. |
-| `provider` | One of `openai`, `anthropic`, `openrouter`, `ollama`, `google`, or `custom`. This determines how the request and response formats are translated. |
-| `apiKey` | The API credential for the provider. Leave empty `""` for local providers like Ollama. |
-| `apiUrl` | The target endpoint. This gets automatically pre-filled by the UI dropdown selection. |
-| `externalModelName` | The exact model ID expected by the target provider (e.g., `gpt-4o`, `claude-3-5-sonnet-latest`, `llama3`). |
-| `allowUnauthorized` | (Optional) Set to `true` to bypass SSL certificate validation. Useful for internal/self-signed endpoints. Default: `false`. |
-| `timeout` | (Optional) Request timeout in milliseconds. Default: `120000` (2 minutes). |
-| `maxRetries` | (Optional) Maximum retry attempts for rate-limited/failed requests. Default: `3`. |
+## Gravity Auto Switch
 
-## UI Features
+**Gravity Auto Switch** is an intelligent, cost-aware router built into the proxy:
 
-### Add Model Modal
-
-Click the **"Add Model"** button in Settings → Models to open a polished modal with:
-- Provider dropdown (OpenAI, Anthropic, Google AI Studio, Ollama, OpenRouter, Custom)
-- Automatic URL pre-filling based on provider selection
-- Dynamic Google AI Studio URL generation as you type the model ID
-- Smooth enter/exit animations with backdrop blur
-- Form validation (required fields: Model ID, API Key, API URL)
-- Auto-generated display name if left blank
-
-<p align="center">
-  <img src="assets/add_custom_model_modal.png" alt="Add Custom AI Model Modal" width="45%">
-  <img src="assets/add_custom_model_provider_dropdown.png" alt="API Provider Selection" width="45%">
-</p>
-
-### Custom Models Dashboard
-
-Below the MCP section in Settings → Models, a "Custom Models" section displays all your configured models with:
-- Model name and provider/URL details
-- **Test Connection** button with green ✅ / red ❌ status indicator
-- Hover effects on list items
-- Delete button with confirmation dialog
-- Empty state placeholder when no models are configured
-- Automatic refresh after add/delete operations
-- **Efficient DOM monitoring**: Uses `MutationObserver` with 200ms debounce instead of `setInterval(1000ms)`, dramatically reducing CPU overhead. The observer auto-disconnects after successful injection and re-attaches on SPA page transitions via URL change detection.
-
-<p align="center">
-  <img src="assets/custom_models_dashboard.png" alt="Custom Models Dashboard" width="800">
-</p>
-
-### SSL Bypass (Self-Signed / Internal CAs)
-
-For enterprise environments using self-signed certificates or internal Certificate Authorities (e.g., corporate proxy servers, private API endpoints), add `"allowUnauthorized": true` to your model config:
-
-```json
-{
-  "name": "models/internal-model",
-  "displayName": "Internal LLM (Corporate)",
-  "description": "Company-hosted model behind self-signed cert",
-  "provider": "custom",
-  "apiKey": "...",
-  "apiUrl": "https://llm.internal.company.com/v1",
-  "externalModelName": "llama3",
-  "allowUnauthorized": true
-}
-```
-
-> [!WARNING]
-> When `allowUnauthorized` is enabled, a warning is logged to the console. SSL bypass is **only** applied to the specific model, never globally.
+- **Tier Mapping**: Assign verified models into **Cheap**, **Mid-priced**, and **Strong** tiers.
+- **Modes**: Choose between **Budget friendly**, **Balanced**, and **Max performance**.
+- **Capability Verification**: Protects complex operations (tool execution, attachments, workspace edits) by guaranteeing only models verified for those features are selected.
+- **Failover Safety Net**: Automatically falls back to the next eligible model in your priority order if an upstream provider returns rate limits (429) or server errors (5xx).
 
 ---
 
-## Security Considerations
+## Security & API Key Encryption
 
-> [!WARNING]
-> **API Key Security**: All API keys are encrypted at rest using AES-256-GCM via Electron's `safeStorage` (macOS Keychain / Windows DPAPI). Never share your `custom_models.json` file or expose API keys in logs.
-
-> [!CAUTION]
-> **SSL Verification**: The `allowUnauthorized: true` option disables TLS certificate validation. Only use this for trusted internal/self-signed endpoints. Enabling it for public API connections exposes you to man-in-the-middle attacks.
-
-### Safe Defaults
-
-- **Timeout**: Custom model API requests have a 120-second default timeout (configurable via `timeout` field). Google proxy requests have 30-60 second timeouts.
-- **Body Size Limit**: Request bodies are capped at 10MB to prevent memory exhaustion. Exceeding returns `413 Payload Too Large`.
-- **No Diagnostic Leaks**: Raw API responses are never written to disk. CSRF tokens are masked in console output.
-- **Masked Keys**: API keys in the UI are displayed as `sk-...XXXX` (last 4 characters only).
-- **Managed State**: Proxy cleanup interval is properly stopped on shutdown, preventing orphaned timers.
+- **Encrypted at Rest**: API keys stored in `custom_models.json` are encrypted via Electron's `safeStorage` (Windows DPAPI / macOS Keychain), with a base64 fallback when the OS store is unavailable.
+- **Masked in UI**: Keys are displayed as `sk-...XXXX` to prevent exposure.
+- **No Disk Logging**: Raw request payloads and authorization headers are never logged to plain disk files.
+- **Safe SSL Defaults**: Strict certificate validation by default, with optional per-model `"allowUnauthorized": true` for local/corporate self-signed environments.
 
 ---
 
-## Troubleshooting
+## Troubleshooting & FAQs
 
-### Port Conflict
-If port `50999` is in use, the proxy auto-falls back to a random port. Check `~/.gemini/antigravity/active_port`.
+### 1. Re-running after Antigravity IDE Updates
+When Google releases an update to Antigravity IDE, the installer restores clean versions of `workbench.desktop.main.js`, `main.js`, and `language_server_windows_x64.exe`.
+- **Fix**: Simply run `.\deploy-ide.ps1` (or `repatch.bat`) to reapply all patches.
 
-### Language Server Crashes
-Auto-restarts up to 3 times in 60 seconds. Check logs at:
-- **Windows**: `%LOCALAPPDATA%\antigravity\logs\`
-- **macOS**: `~/Library/Logs/antigravity/`
 
-### SSL/TLS Errors
-1. Ensure the provider's certificate is valid
-2. As last resort, add `"allowUnauthorized": true` to model config
-3. For internal CAs, install the CA certificate in your system trust store
-
-### Model Not Appearing
-1. Verify model name starts with `models/`
-2. Check `apiUrl` is correct
-3. Restart Antigravity after adding models
-4. Use the **Test Connection** button to verify endpoint accessibility
-
-### Connection Timeouts
-1. Check if the provider's API is reachable (`curl -I <apiUrl>`)
-2. Increase `timeout` field in model config (e.g., `"timeout": 180000` for 3 minutes)
-3. Verify network/proxy/VPN settings
-
-### Google Cloud Data Cloud Telemetry Hook Error (`MODULE_NOT_FOUND`)
-If agent actions or tool calls are blocked with:
-```
-Error: Cannot find module '...\googlecloudtools.datacloud_telemetry\"...\telemetry_hook_bundle.js"'
-```
-**Cause:** The Data Cloud IDE extension automatically registers a pre-tool execution hook plugin with a nested quotes path bug on Windows.
-**Fix:**
-1. Delete the plugin directory:
-   - **Windows:** Delete `C:\Users\<User>\.gemini\config\plugins\googlecloudtools.datacloud_telemetry`
-2. In Antigravity IDE / VS Code, open Extensions (`Ctrl+Shift+X`) and disable **Google Cloud Data Cloud** if telemetry is not required.
 
 ---
 
 ## Developer Guide
 
-### Project Setup
+### Project Setup & Tests
 
 ```bash
-npm install          # Install dependencies
-npx tsc              # Compile TypeScript → dist/
-npx tsc --watch      # Watch mode for development
+# Install dependencies
+npm install
+
+# Compile TypeScript
+npm run build
+
+# Run unit tests (159 passing tests)
+npx vitest run
 ```
 
-### Adding a New Provider
+### Adding a New Provider Translator
 
-1. Create `src/proxy/translators/<provider>.ts` with these exports:
-   - `mapGeminiTo<Provider>(geminiBody, modelName)` → provider-format request
-   - `map<Provider>ToGemini(providerRes, modelName)` → Gemini-format response
-   - `map<Provider>ChunkToGemini(chunk, modelName)` → streaming chunk handler
-2. The registry auto-discovers new translator modules, so no config changes are needed
-3. Add provider to `getProviderHeaders()` in `registry.ts` if authentication differs
-4. Add provider option to UI dropdown in `src/preload.ts`
-5. Update `supportsStreaming()` in `registry.ts` if applicable
-
-### TypeScript Architecture
-
-- **Strict mode**: `strict: true` in `tsconfig.json` (target: ES2020, module: CommonJS)
-- **Centralized types**: Model capabilities in `modelUtils.ts`, shared state in `shared.ts`
-- **No `eval()`**: JSON repair uses `repairPartialJson()` instead of dangerous `eval()` calls
-- **No `any` in critical paths**: Request/response mapping uses explicit interfaces
-
-### Debug Mode
-```powershell
-$env:HEADLESS="1"; .\Antigravity.exe
-```
-
-Set `DEBUG=antigravity:*` for verbose logging (debug level captures stream parse fallbacks and wire-level details).
+1. Create `src/proxy/translators/<provider>.ts`.
+2. Implement:
+   - `mapGeminiTo<Provider>(geminiBody, modelName)`
+   - `map<Provider>ToGemini(providerRes, modelName)`
+   - `map<Provider>ChunkToGemini(chunk, modelName)`
+3. The registry auto-discovers the module from the `translators/` directory by filename — no manual registration is needed.
+4. For OpenAI-compatible / Anthropic-compatible providers, register the provider key in the relevant compat set in `src/proxy/registry.ts` (`OPENAI_COMPAT` or `ANTHROPIC_COMPAT`).
+5. Run `npx vitest run` to validate formatting and streaming translation.
 
 ---
 
-## Changelog
+## License & Attribution
 
-### v2.8.1 — Antigravity v2.8.1 Compatibility & IDE Model Injection Fix
-- **Fixed (Antigravity IDE)**: Resolved custom models not appearing in the Antigravity IDE chat dropdown. Directly injects computed model slugs and placeholder IDs into `agentModelSorts.groups[].modelIds` across all proxy response paths (main, timeout, parse fallback, network error).
-- **Fixed (Duplicates)**: Eliminated 4x duplicate model entries in the standalone Antigravity model list by registering only the primary canonical slug key in `models` dictionary.
-- **Fixed (Deploy & Sync)**: Updated `deploy.ps1` to terminate process trees using `taskkill /T`, patch IDE `extension.js`, and launch both standalone Antigravity and Antigravity IDE seamlessly.
-- **Maintained**: Full backwards-compatibility for `electronUpdater.getState()` to avoid renderer startup crashes.
+Distributed under the **Apache License 2.0**. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
 
-### Gravity Auto Switch v3 — configurable cost-aware routing
-
-- **New**: Optional **Auto** chat mode routes only your verified custom API models
-  through user-assigned **Cheap**, **Mid-priced**, and **Strong** tiers.
-- **Control**: You set each tier's **Primary** model and ordered fallbacks; the
-  selected order is respected rather than replaced by automatic price guesses.
-- **Savings modes**: **Budget friendly**, **Balanced**, and **Max performance**
-  choose from your configured tiers according to the complexity of the request.
-- **Safety**: Google-managed models are never rerouted. Tool use, attachments,
-  protected work, and unverified capabilities follow conservative eligibility
-  rules; manual selection is retained if no safe route is available.
-- **Reliability**: A route that fails before returning a response can fall back
-  to the next eligible model in the configured order. Re-verifying a model
-  refreshes its proof without overwriting its tier, priority, or enabled state.
-- **Verification**: The release was validated with `npm run build` and
-  `npx vitest run` (**159 tests passed**).
-
-See [Gravity Auto Switch](docs/gravity-auto-switch.md) for configuration,
-routing behavior, logging, and limitations.
-
-### v2.4.2 — Antigravity v2.4.2 Compatibility & MCP Subsystem Support
-- **Compatibility**: Full support for **Antigravity v2.4.2** MCP (Model Context Protocol) subsystem.
-- **Fixed**: Solid/blank screen after patching on v2.4.2 — bridged `mcpAPI` methods (`runMcpServer`, `stopMcpServer`, `stopAllMcpServers`, `sendMcpMessage`, and event listeners) via `contextBridge` in `src/preload.ts`.
-- **Fixed**: Registered backend IPC handlers for `mcp:*` commands in `src/ipcHandlers.ts` and process shutdown hooks in `src/main.ts`.
-- **Fixed**: Corrected batch script execution in `repatch.bat` using `call` to ensure automatic patch compilation and deployment.
-
-### v2.2.0 — Antigravity v2.3.1 Compatibility
-- **Compatibility**: Updated to work with **Antigravity v2.3.1** (previously only supported up to v2.0.x)
-- **Fixed**: Solid/blank screen after patching — restored 3 missing contextBridge APIs that v2.3.1 frontend requires (`ide.isInstalled`, `electronUpdater.getState`, `electronNative.revealInFilePicker`)
-- **Fixed**: Auto-updater now properly accepts `settingsService` parameter matching v2.3.1 signature (`initAutoUpdater(isHeadless, settingsService)`)
-- **Fixed**: Restored `setAutoUpdateChecking`, `getLastState`, and settings-driven periodic update scheduling that v2.3.1 depends on
-- **Fixed**: Restored `AUTO_CHECK_FOR_UPDATES` setting key and `onSettingChanged` listener in SettingsService
-- **Fixed**: Deploy scripts no longer use `--unpack-dir "node_modules"` which was stripping node_modules from `app.asar` (879 KB instead of ~2 MB), causing broken installations
-- **Improved**: Deploy scripts now detect Antigravity version updates via file timestamp/size comparison and automatically refresh the backup
-- **Improved**: Self-healing logic added — if `app.asar` size drops below 80% of backup, it auto-restores before patching
-
-### v2.1.0
-- **TypeScript**: Full migration — all 23 source files converted from JavaScript to TypeScript (`dist/*.js` → `src/*.ts`)
-- **New Provider**: OpenRouter support (300+ models via unified API, OpenAI-compatible format)
-- **OpenRouter UI**: Provider dropdown, auto-filled URL, connection test, icon & color in Settings modal
-- **Dev Experience**: ESLint + Prettier configured with automated `lint`, `format`, `lint:fix` scripts
-- **Test Coverage**: Expanded to 137 tests across 6 test files (registry, proxy, modelUtils, translators)
-- **Cleanup**: Removed 25+ scratch development artifacts, added `.prettierignore`
-- **Architecture**: `ideInstall/` wizard extracted to dedicated TypeScript module
-
-### v2.0.3
-- **Architecture**: Extracted Google AI Studio translator to dedicated module
-- **Architecture**: Managed proxy state cleanup with proper interval lifecycle
-- **New**: Model connectivity test in Settings (green/red status indicator)
-- **New**: Automatic request retry with exponential backoff (429/5xx)
-- **New**: Configurable `maxRetries` per model
-- **Security**: Removed automatic SSL bypass for custom providers
-- **Security**: Added 10MB request body size limit (413 on overflow)
-- **Security**: Masked CSRF token in console output
-- **Security**: Added timeouts to all Google proxy requests (30-60s)
-- **Error handling**: Added debug logging to 6 previously-silent catch blocks
-- **Error handling**: Proper error propagation in streaming response handlers
-- **Fixed**: `deploy.ps1` now uses `$PSScriptRoot` (portable, no hardcoded paths)
-- **Documentation**: Updated README with TypeScript architecture, security defaults, troubleshooting
-- **Package**: Added `Apache-2.0` license field to `package.json`
-
-### v2.0.2
-- **Security**: Replaced `eval()` with safe `repairPartialJson()` (code injection fix)
-- **Security**: SSL bypass now only when `allowUnauthorized: true` (not all custom providers)
-- **Security**: Removed diagnostic `api_response_raw.json` disk writes
-- **Security**: Added 10MB request body size limit
-- **Security**: Added 120s configurable API request timeout
-- **Error handling**: Added error handlers for streaming and non-streaming API responses
-- **Fixed**: `deploy.ps1` hardcoded path to now uses `$PSScriptRoot`
-- **Documentation**: Added Security Considerations, Troubleshooting, and Developer Guide
-
-### v2.0.2 (2026-05-24)
-- **Critical fix**: Antigravity v2.0.6 update hardcoded `fetchAvailableModels` URL to `daily-cloudcode-pa.googleapis.com`, bypassing the local proxy. Custom models disappeared from the chat dropdown.
-- **Binary patch**: The Language Server binary is now automatically patched at build time to replace the hardcoded Google URL with the local proxy URL.
-- **URL padding handler**: Added regex-based URL cleanup in the proxy to strip binary patch padding.
-- **Model API fallbacks**: Added `GetAvailableModels` redirect, preload network interceptors, and forced page reload for robust model loading across Antigravity versions.
-
-### v2.0.0
-- Initial release: multi-provider proxy, API key encryption, streaming, tool calls, custom UI
-
----
-
-## Contributing
-
-Pull requests welcome. Please ensure:
-1. Code follows existing style (JSDoc comments, consistent error handling)
-2. New provider translators include both request and response mapping
-3. Security-sensitive code avoids `eval`, plaintext key logging, and improper SSL handling
-4. TypeScript compiles cleanly: `npx tsc --noEmit`
-
----
-
-## License and attribution
-
-This is a modified derivative of the **Antigravity Custom Model Enabler** project
-created by Vahap Ogut (see this repository’s Git history). Gravity Auto Switch
-and its documentation are additional modifications by the maintainers of this
-repository.
-
-This repository is distributed under the Apache License 2.0. See
-[LICENSE](LICENSE) and [NOTICE](NOTICE). Retain applicable copyright,
-attribution, and license notices when redistributing modified versions.
-
----
-
-## Developer
-
-**Abdulvahap OGUT** — Original project creator
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/abdulvahap-ogut-343992398/)
-
-**Mohsen and contributors** — Gravity Auto Switch and fork maintenance
-Website: [mrmp.pro](https://mrmp.pro/)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/mohsen-mahmodpour/)
+- **Original Project Creator**: Abdulvahap OGUT
+- **IDE Architecture, Dual Binary Patching & Gravity Auto Switch**: Mohsen and contributors ([mrmp.pro](https://mrmp.pro/))

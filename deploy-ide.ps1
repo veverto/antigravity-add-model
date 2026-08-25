@@ -1,19 +1,21 @@
 # Antigravity IDE Safe Deploy
-# Only modifies Antigravity IDE application
+# Builds TypeScript proxy, installs modules, applies Node.js patcher, and syncs custom models
 
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Antigravity IDE Deploy Script" -ForegroundColor Yellow
 Write-Host "  MRMPPRO | IDE Custom Models & Standalone Proxy" -ForegroundColor Magenta
 Write-Host "============================================" -ForegroundColor Cyan
 
-# 1. Close Antigravity IDE Only
+# 1. Close Antigravity IDE & Language Server processes completely
 Write-Host ""
-Write-Host "[1/5] Closing Antigravity IDE..." -ForegroundColor Yellow
+Write-Host "[1/6] Closing Antigravity IDE & Language Server..." -ForegroundColor Yellow
 taskkill /F /IM "Antigravity IDE.exe" /T 2>$null | Out-Null
 taskkill /F /IM "language_server_windows_x64.exe" /T 2>$null | Out-Null
 $ideProcs = Get-Process -Name "Antigravity IDE*", "language_server_windows_x64*" -ErrorAction SilentlyContinue
-if ($ideProcs) { $ideProcs | Stop-Process -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 1
+if ($ideProcs) { 
+    $ideProcs | Stop-Process -Force -ErrorAction SilentlyContinue 
+}
+Start-Sleep -Seconds 2
 Write-Host "   OK" -ForegroundColor Green
 
 # 2. Define paths
@@ -27,8 +29,20 @@ if (-not (Test-Path $IdeMainPath)) {
     exit 1
 }
 
-# 3. Copy proxy modules to IDE
-Write-Host "[2/5] Copying proxy modules to Antigravity IDE..." -ForegroundColor Yellow
+# 3. Build latest TypeScript
+Write-Host "[2/6] Building TypeScript..." -ForegroundColor Yellow
+Push-Location $ProjectDir
+try {
+    npm run build
+    Write-Host "   OK - Build succeeded" -ForegroundColor Green
+} catch {
+    Write-Host "   WARNING - TypeScript build error: $_" -ForegroundColor Yellow
+} finally {
+    Pop-Location
+}
+
+# 4. Copy proxy modules to IDE
+Write-Host "[3/6] Copying proxy modules to Antigravity IDE..." -ForegroundColor Yellow
 if (Test-Path $IdeProxyDir) { Remove-Item $IdeProxyDir -Recurse -Force }
 New-Item -ItemType Directory -Path $IdeProxyDir -Force | Out-Null
 
@@ -60,126 +74,58 @@ if (-not (Test-Path $IdeElectronLog)) {
         Copy-Item $srcElectronLog $IdeElectronLog -Recurse -Force
     }
 }
+
+# Write CommonJS package.json in proxy dir to avoid ESM loader errors in IDE
+$proxyPkgJson = '{"type":"commonjs"}'
+[System.IO.File]::WriteAllText((Join-Path $IdeProxyDir "package.json"), $proxyPkgJson)
 Write-Host "   OK" -ForegroundColor Green
 
-# 4. Patch main.js with self-sufficient proxy startup
-Write-Host "[3/5] Patching Antigravity IDE main.js..." -ForegroundColor Yellow
-$content = [System.IO.File]::ReadAllText($IdeMainPath)
-$patchMarker = "// MRMPPRO_SELF_SUFFICIENT_PROXY_V2"
-$oldPatchMarker = "// MRMPPRO_GET_AVAILABLE_MODELS_INTERCEPT"
+# 5. Patch UI bundles, main.js, and update checksums via Node.js
+Write-Host "[4/6] Patching Antigravity IDE main.js & UI bundles via Node.js..." -ForegroundColor Yellow
+node "$ProjectDir\patch-ide.js"
 
-if ($content.Contains($patchMarker)) {
-    $markerIdx = $content.IndexOf($patchMarker)
-    $content = $content.Substring(0, $markerIdx).TrimEnd()
-} elseif ($content.Contains($oldPatchMarker)) {
-    $markerIdx = $content.IndexOf($oldPatchMarker)
-    $content = $content.Substring(0, $markerIdx).TrimEnd()
-}
-
-$patchCode = @"
-
-$patchMarker
-// MRMPPRO Self-Sufficient Proxy for Antigravity IDE
-(async function _mrmppro_ide_proxy_init() {
-  'use strict';
-  try {
-    const { createRequire } = await import('node:module');
-    const { fileURLToPath } = await import('node:url');
-    const { dirname, join } = await import('node:path');
-
-    const _require = createRequire(import.meta.url);
-    const _filename = fileURLToPath(import.meta.url);
-    const _dirname = dirname(_filename);
-
-    let _proxyPort = 0;
-    const _proxyModulePath = join(_dirname, 'mrmppro-proxy', 'proxy');
-
-    try {
-      const _proxyModule = _require(_proxyModulePath);
-      _proxyModule.startProxy().then(function(port) {
-        _proxyPort = port;
-        console.log('[MRMPPRO IDE Proxy] Proxy server started on port ' + port);
-      }).catch(function(err) {
-        console.error('[MRMPPRO IDE Proxy] Failed to start proxy:', err);
-      });
-    } catch (loadErr) {
-      console.error('[MRMPPRO IDE Proxy] Failed to load proxy module:', loadErr);
-    }
-
-    try {
-      const { app: _mrmpApp, session: _mrmpSession } = _require('electron');
-      _mrmpApp.whenReady().then(function() {
-        _mrmpSession.defaultSession.webRequest.onBeforeRequest(function(details, callback) {
-          if (details.url && details.url.includes('SetCloudCodeURL')) {
-            callback({ cancel: true });
-            return;
-          }
-          if (details.url && details.url.includes('LanguageServerService/GetAvailableModels')) {
-            var port = _proxyPort || 50999;
-            var redirectTarget = 'http://127.0.0.1:' + port + '/GetAvailableModels?ls=' + encodeURIComponent(details.url);
-            callback({ redirectURL: redirectTarget });
-            return;
-          }
-          callback({});
-        });
-      }).catch(function() {});
-    } catch (e) {
-      console.error('[MRMPPRO IDE Proxy] Interceptor error:', e);
-    }
-  } catch (initErr) {
-    console.error('[MRMPPRO IDE Proxy] Fatal init error:', initErr);
-  }
-})();
-"@
-
-$newContent = $content + "`n" + $patchCode
-[System.IO.File]::WriteAllText($IdeMainPath, $newContent, (New-Object System.Text.UTF8Encoding $false))
-Write-Host "   OK - main.js patched" -ForegroundColor Green
-
-# 5. Patch extension.js
-Write-Host "[4/5] Patching Antigravity IDE extension.js..." -ForegroundColor Yellow
-$extJsPath = "$IdeAppDir\extensions\antigravity\dist\extension.js"
-if (Test-Path $extJsPath) {
-    try {
-        $extJsContent = [System.IO.File]::ReadAllText($extJsPath)
-        $extJsPatched = $extJsContent -replace '([a-zA-Z0-9_$]+)\.getCloudCodeUrl\(\)', '(async ()=>"http://127.0.0.1:50999")()'
-        [System.IO.File]::WriteAllText($extJsPath, $extJsPatched)
-        Write-Host "   OK - extension.js patched" -ForegroundColor Green
-    } catch {
-        Write-Host "   WARNING - Could not write extension.js: $_" -ForegroundColor Yellow
-    }
-}
-
-# Patch IDE Binary if present
+# 6. Binary Patch Language Server executable (Dual Endpoint Byte Patch)
+Write-Host "[5/6] Patching IDE Language Server binary..." -ForegroundColor Yellow
 $ideLs = "$IdeAppDir\extensions\antigravity\bin\language_server_windows_x64.exe"
 if (Test-Path $ideLs) {
-    $OriginalUrl = "https://daily-cloudcode-pa.googleapis.com"
-    $PatchedUrl = "http://localhost:50999/v1internal/xxxxxxx"
     try {
         $outBytes = [System.IO.File]::ReadAllBytes($ideLs)
-        $content = [System.Text.Encoding]::ASCII.GetString($outBytes)
-        if (-not $content.Contains($PatchedUrl)) {
-            $offset = $content.IndexOf($OriginalUrl, [System.StringComparison]::Ordinal)
-            if ($offset -ge 0) {
-                $LsBackup = "$ideLs.bak"
-                if (-not (Test-Path $LsBackup)) { Copy-Item $ideLs $LsBackup -Force }
-                $replaceBytes = [System.Text.Encoding]::ASCII.GetBytes($PatchedUrl)
-                [System.Array]::Copy($replaceBytes, 0, $outBytes, $offset, $replaceBytes.Length)
-                [System.IO.File]::WriteAllBytes($ideLs, $outBytes)
-                Write-Host "   OK - IDE Language Server binary patched" -ForegroundColor Green
+        $targets = @(
+            @{ Search = "https://daily-cloudcode-pa.googleapis.com"; Replace = "http://localhost:50999/v1internal/xxxxxxx" },
+            @{ Search = "https://cloudcode-pa.googleapis.com"; Replace = "http://localhost:50999/v1internal/x" }
+        )
+        $modified = $false
+        foreach ($t in $targets) {
+            $searchBytes = [System.Text.Encoding]::ASCII.GetBytes($t.Search)
+            $replaceBytes = [System.Text.Encoding]::ASCII.GetBytes($t.Replace)
+            for ($i = 0; $i -le $outBytes.Length - $searchBytes.Length; $i++) {
+                $match = $true
+                for ($j = 0; $j -lt $searchBytes.Length; $j++) {
+                    if ($outBytes[$i + $j] -ne $searchBytes[$j]) {
+                        $match = $false
+                        break
+                    }
+                }
+                if ($match) {
+                    [System.Array]::Copy($replaceBytes, 0, $outBytes, $i, $replaceBytes.Length)
+                    $modified = $true
+                    $i += $replaceBytes.Length - 1
+                }
             }
         }
-    } catch {}
+        if ($modified) {
+            [System.IO.File]::WriteAllBytes($ideLs, $outBytes)
+            Write-Host "   OK - IDE Language Server binary patched on disk" -ForegroundColor Green
+        } else {
+            Write-Host "   OK - IDE Language Server binary already patched" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "   WARNING - Could not patch LS binary: $_" -ForegroundColor Yellow
+    }
 }
 
-# Sync Models & MCP Config
-Write-Host "[5/5] Syncing Custom Models & MCP Config..." -ForegroundColor Yellow
-$repatchScript = "d:\mrmp skills\gravity-skills\scripts\Repatch-AntigravityModels.ps1"
-if (Test-Path $repatchScript) {
-    & $repatchScript -Force -Confirm:$false
-}
-
-# Launch IDE
+# 7. Launch Antigravity IDE
+Write-Host "[6/6] Launching Antigravity IDE..." -ForegroundColor Yellow
 $IdeExePath = "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe"
 if (Test-Path $IdeExePath) {
     Start-Process -FilePath $IdeExePath
@@ -188,5 +134,5 @@ if (Test-Path $IdeExePath) {
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  SUCCESS! Antigravity IDE repatched." -ForegroundColor Green
+Write-Host "  SUCCESS! Antigravity IDE deployed and ready." -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Cyan

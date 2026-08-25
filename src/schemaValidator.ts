@@ -94,9 +94,9 @@ export function validateCustomModel(model: unknown): ValidationResult {
   }
 
   const name = m.name as string;
-  // Validate model name format: should start with "models/" or be a valid path
-  if (!name.startsWith('models/') && !name.includes('/')) {
-    return { valid: false, error: 'Model name must start with "models/"' };
+  // Validate model name format: non-empty string
+  if (!name || name.trim() === '') {
+    return { valid: false, error: 'Model name must not be empty' };
   }
 
   const provider = m.provider as string;
