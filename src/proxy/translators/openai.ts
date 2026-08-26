@@ -108,6 +108,7 @@ interface OpenAIRequestBody {
   temperature?: number;
   max_tokens?: number;
   max_completion_tokens?: number;
+  reasoning_effort?: 'low' | 'medium' | 'high';
   tools?: OpenAITool[];
   stream?: boolean;
 }
@@ -202,7 +203,7 @@ function mapGeminiToolsToOpenAI(geminiTools: GeminiTool[]): OpenAITool[] {
   return openaiTools;
 }
 
-export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string): OpenAIRequestBody {
+export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: string, effort?: string): OpenAIRequestBody {
   const messages: OpenAIMessage[] = [];
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
@@ -340,6 +341,11 @@ export function mapGeminiToOpenAI(geminiBody: GeminiRequestBody, modelName: stri
     ...(needsNoTemperature ? {} : { temperature: geminiBody.generationConfig?.temperature ?? 0.7 }),
     ...(needsCompletionTokens ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
   };
+
+  const normalizedEffort = effort?.toLowerCase();
+  if (normalizedEffort === 'low' || normalizedEffort === 'medium' || normalizedEffort === 'high') {
+    payload.reasoning_effort = normalizedEffort;
+  }
 
   if (geminiBody.tools && Array.isArray(geminiBody.tools)) {
     const openaiTools = mapGeminiToolsToOpenAI(geminiBody.tools);

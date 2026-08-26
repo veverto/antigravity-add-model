@@ -29,6 +29,8 @@ export interface CustomModel {
   _slug?: string;
   timeout?: number;
   maxRetries?: number;
+  reasoningEffortLevels?: string[];
+  effort?: string;
 }
 
 interface GeminiRequestBody {
@@ -183,6 +185,50 @@ function isModelMatch(m: CustomModel, targetModel: string | undefined, targetId?
     enumInt === cleanTarget ||
     (cleanTargetId !== '' && (cleanName === cleanTargetId || slug === cleanTargetId || enumName === cleanTargetId || enumInt === cleanTargetId))
   );
+}
+
+function matchCustomModelWithEffort(
+  models: CustomModel[],
+  targetModel: string | undefined,
+  targetId?: string | undefined,
+): CustomModel | undefined {
+  if (!targetModel && !targetId) return undefined;
+
+  for (const m of models) {
+    if (isModelMatch(m, targetModel, targetId)) {
+      return { ...m };
+    }
+
+    // Check effort variants (e.g. custom-kimi-k3-high, custom-kimi-k3-default, etc.)
+    const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0
+      ? m.reasoningEffortLevels
+      : ['default', 'low', 'medium', 'high'];
+
+    const cleanTarget = targetModel ? targetModel.replace(/^models\//, '').toLowerCase() : '';
+    const cleanTargetId = targetId ? targetId.replace(/^models\//, '').toLowerCase() : '';
+    const baseSlug = toSlug(m).toLowerCase();
+    const baseName = m.name.replace(/^models\//, '').toLowerCase();
+
+    for (const lvl of levels) {
+      const effortSuffix = `-${lvl.toLowerCase()}`;
+      const effortSlug = `${baseSlug}${effortSuffix}`;
+      const effortName = `${baseName}${effortSuffix}`;
+
+      if (
+        cleanTarget === effortSlug ||
+        cleanTarget === effortName ||
+        cleanTargetId === effortSlug ||
+        cleanTargetId === effortName
+      ) {
+        return {
+          ...m,
+          effort: lvl.toLowerCase(),
+        };
+      }
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -572,7 +618,7 @@ function handleCustomModelRequest(
 
   const provider = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
 
-  const payload = registry.translateRequest(provider, geminiBody, model.externalModelName);
+  const payload = registry.translateRequest(provider, geminiBody, model.externalModelName, model.effort);
   const headers = registry.getProviderHeaders(provider, model.apiKey);
 
   if (isStream && registry.supportsStreaming(provider)) {
@@ -1278,9 +1324,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               } else if (target && typeof target === 'object') {
                 const result = { ...(target as Record<string, unknown>) };
                 customModels.forEach((m) => {
-                  const slug = toSlug(m);
+                  const baseSlug = toSlug(m);
                   const cap = detectModelCapabilities(m, true);
-                  const entry: Record<string, unknown> = {
+                  const baseEntry: Record<string, unknown> = {
                     displayName: m.displayName || m.name || 'Custom Model',
                     supportsImages: cap.supportsImages,
                     supportsThinking: cap.isThinking,
@@ -1292,7 +1338,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                     modelProvider: 'MODEL_PROVIDER_GOOGLE',
                   };
                   if (cap.supportsImages) {
-                    entry.supportedMimeTypes = {
+                    baseEntry.supportedMimeTypes = {
                       'image/png': true,
                       'image/jpeg': true,
                       'image/webp': true,
@@ -1301,17 +1347,18 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                       'image/heif': true,
                     };
                   }
-                  const placeholderId = generateModelPlaceholderId(m);
-                  // Only register the slug as the canonical key — the renderer
-                  // iterates every key in models{} and shows each as a separate
-                  // entry. Extra keys (models/slug, placeholderId, etc.) caused
-                  // 4× duplicates. isModelMatch() already handles all name formats
-                  // for generation routing, so no lookup aliases are needed here.
-                  (result as Record<string, unknown>)[slug] = entry;
-                  m._slug = slug;
-                  log.info(
-                    `[Proxy] Custom model "${m.displayName}" => slug: ${slug}, placeholder: ${placeholderId}`,
-                  );
+
+                  const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
+                  for (const lvl of levels) {
+                    const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
+                    const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
+                    (result as Record<string, unknown>)[slug] = {
+                      ...baseEntry,
+                      displayName: disp,
+                    };
+                    log.info(`[Proxy] Custom model "${disp}" => slug: ${slug}`);
+                  }
+                  m._slug = baseSlug;
                 });
                 return result;
               }
@@ -1335,22 +1382,31 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             if (!merged) {
               const mappedCustom: Record<string, unknown> = {};
               customModels.forEach((m) => {
+                const baseSlug = m._slug || toSlug(m);
+                const cap = detectModelCapabilities(m, true);
                 const googleModelTemplate = {
                   name: m.name,
                   version: '1.0',
                   displayName: m.displayName,
                   description: m.description,
-                  inputTokenLimit: detectModelCapabilities(m, true).maxTokens,
-                  outputTokenLimit: detectModelCapabilities(m, true).maxOutputTokens,
+                  inputTokenLimit: cap.maxTokens,
+                  outputTokenLimit: cap.maxOutputTokens,
                   supportedGenerationMethods: ['generateContent', 'countTokens'],
-                  temperature: detectModelCapabilities(m, true).isThinking ? undefined : 0.7,
-                  topP: detectModelCapabilities(m, true).isThinking ? undefined : 0.9,
-                  topK: detectModelCapabilities(m, true).isThinking ? undefined : 40,
+                  temperature: cap.isThinking ? undefined : 0.7,
+                  topP: cap.isThinking ? undefined : 0.9,
+                  topK: cap.isThinking ? undefined : 40,
                   modelProvider: 'MODEL_PROVIDER_GOOGLE',
                   apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
                 };
-                const slug = m._slug || toSlug(m);
-                mappedCustom[slug] = googleModelTemplate;
+                const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
+                for (const lvl of levels) {
+                  const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
+                  const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
+                  mappedCustom[slug] = {
+                    ...googleModelTemplate,
+                    displayName: disp,
+                  };
+                }
               });
               googleJson.models = Object.assign(googleJson.models || {}, mappedCustom);
             }
@@ -1365,10 +1421,15 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             }
 
             // Inject custom model slugs AND placeholder IDs into agentModelSorts
-            // Compute slugs directly (do NOT rely on _slug mutation from mergeModels)
+            // Compute slugs directly (including reasoning effort variants)
             const customModelIds: string[] = [];
             customModels.forEach((m) => {
-              customModelIds.push(toSlug(m));
+              const baseSlug = toSlug(m);
+              const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
+              for (const lvl of levels) {
+                const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
+                customModelIds.push(slug);
+              }
             });
 
             if (customModelIds.length > 0) {
@@ -1580,10 +1641,10 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
         if (modelName || modelId) {
           const customModels = loadCustomModels();
-          const matchedCustomModel = customModels.find((m) => isModelMatch(m, modelName, modelId));
+          const matchedCustomModel = matchCustomModelWithEffort(customModels, modelName, modelId);
           if (matchedCustomModel) {
             log.info(
-              `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}`,
+              `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}${matchedCustomModel.effort ? ` (effort: ${matchedCustomModel.effort})` : ''}`,
             );
             const isStream = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
             const actualGeminiBody = (reqJson.request || reqJson) as GeminiRequestBody;
@@ -1638,15 +1699,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       }
 
       const customModels = loadCustomModels();
-      const matchedCustomModel = customModels.find((m) => {
-        const enumName = generateModelPlaceholderId(m);
-        return (
-          m.name === matchedModelName ||
-          toSlug(m) === matchedModelName ||
-          enumName === matchedModelName ||
-          'models/' + enumName === matchedModelName
-        );
-      });
+      const matchedCustomModel = matchCustomModelWithEffort(customModels, matchedModelName);
 
       if (matchedCustomModel) {
         try {

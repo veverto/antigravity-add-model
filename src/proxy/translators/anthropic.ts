@@ -104,6 +104,7 @@ interface AnthropicRequestBody {
   max_tokens: number;
   temperature?: number;
   tools?: AnthropicTool[];
+  thinking?: { type: 'enabled'; budget_tokens: number };
 }
 
 interface AnthropicResponse {
@@ -174,7 +175,7 @@ function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   return anthropicTools;
 }
 
-export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string): AnthropicRequestBody {
+export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string, effort?: string): AnthropicRequestBody {
   const messages: AnthropicMessage[] = [];
   let system: string | undefined = undefined;
 
@@ -265,9 +266,19 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
     max_tokens: geminiBody.generationConfig?.maxOutputTokens ?? 16000,
   };
 
-  // Claude thinking models don't support temperature (centralized detection)
+  const normalizedEffort = effort?.toLowerCase();
+  if (normalizedEffort === 'high') {
+    result.thinking = { type: 'enabled', budget_tokens: 16384 };
+  } else if (normalizedEffort === 'medium') {
+    result.thinking = { type: 'enabled', budget_tokens: 8192 };
+  } else if (normalizedEffort === 'low') {
+    result.thinking = { type: 'enabled', budget_tokens: 2048 };
+  }
+
+  // Claude thinking models (or explicit thinking effort) don't support temperature
   const { isThinkingModel } = detectModelCapabilitiesByName(modelName);
-  if (!isThinkingModel) {
+  const hasThinking = !!result.thinking || isThinkingModel;
+  if (!hasThinking) {
     const temp = geminiBody.generationConfig?.temperature;
     if (temp !== undefined && temp !== null) result.temperature = temp;
   }

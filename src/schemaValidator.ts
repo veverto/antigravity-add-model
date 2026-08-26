@@ -130,6 +130,21 @@ export function validateCustomModel(model: unknown): ValidationResult {
   if (m.allowUnauthorized !== undefined && typeof m.allowUnauthorized !== 'boolean') {
     return { valid: false, error: 'allowUnauthorized must be a boolean' };
   }
+  if (m.reasoningEffortLevels !== undefined) {
+    if (!Array.isArray(m.reasoningEffortLevels)) {
+      return { valid: false, error: 'reasoningEffortLevels must be an array of strings' };
+    }
+    const validLevels = ['low', 'medium', 'high', 'default'];
+    for (let i = 0; i < m.reasoningEffortLevels.length; i++) {
+      const lvl = m.reasoningEffortLevels[i];
+      if (typeof lvl !== 'string' || !validLevels.includes(lvl.toLowerCase())) {
+        return {
+          valid: false,
+          error: `Invalid reasoning effort level at index ${i}: "${lvl}". Must be one of: "Low", "Medium", "High", "Default"`,
+        };
+      }
+    }
+  }
 
   return { valid: true };
 }

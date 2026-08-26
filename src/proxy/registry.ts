@@ -15,13 +15,13 @@ import log from 'electron-log';
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export interface TranslatorModule {
-  mapGeminiToOpenAI?: (body: unknown, modelName: string) => unknown;
+  mapGeminiToOpenAI?: (body: unknown, modelName: string, effort?: string) => unknown;
   mapOpenAIToGemini?: (res: unknown, modelName: string) => unknown;
   mapOpenAIChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
-  mapGeminiToAnthropic?: (body: unknown, modelName: string) => unknown;
+  mapGeminiToAnthropic?: (body: unknown, modelName: string, effort?: string) => unknown;
   mapAnthropicToGemini?: (res: unknown, modelName: string) => unknown;
   mapAnthropicChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
-  mapGeminiToGoogle?: (body: unknown, modelName: string) => unknown;
+  mapGeminiToGoogle?: (body: unknown, modelName: string, effort?: string) => unknown;
   mapGoogleToGemini?: (res: unknown, modelName: string) => unknown;
   mapGoogleChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
   getGoogleApiUrl?: (baseUrl: string, modelName: string, isStream: boolean) => string;
@@ -84,17 +84,17 @@ export function getTranslator(provider: string): TranslatorModule | null {
   return translators.get('openai') || null;
 }
 
-export function translateRequest(provider: string, geminiBody: unknown, modelName: string): unknown {
+export function translateRequest(provider: string, geminiBody: unknown, modelName: string, effort?: string): unknown {
   const t = getTranslator(provider);
 
   if (provider === 'google') return geminiBody;
-  if (OPENAI_COMPAT.has(provider)) return t?.mapGeminiToOpenAI ? t.mapGeminiToOpenAI(geminiBody, modelName) : geminiBody;
-  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName) : geminiBody;
+  if (OPENAI_COMPAT.has(provider)) return t?.mapGeminiToOpenAI ? t.mapGeminiToOpenAI(geminiBody, modelName, effort) : geminiBody;
+  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName, effort) : geminiBody;
 
   // Generic: try mapGeminiTo<Provider> convention
   const fnName = `mapGeminiTo${provider.charAt(0).toUpperCase() + provider.slice(1)}`;
   if (t && typeof t[fnName] === 'function') {
-    return (t[fnName] as (...args: unknown[]) => unknown)(geminiBody, modelName);
+    return (t[fnName] as (...args: unknown[]) => unknown)(geminiBody, modelName, effort);
   }
 
   log.warn(`[TranslatorRegistry] No request translator for provider "${provider}", passing through`);

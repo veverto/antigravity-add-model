@@ -35,9 +35,29 @@ const customModelsJsonLiteral = JSON.stringify(customModels);
 if (fs.existsSync(wbPath)) {
   let wbCode = fs.readFileSync(wbPath, 'utf8');
 
-  // A. Patch DQo group builder (supports initial and re-patching)
+  // A. Patch EOu, U5n, and SOu for reasoning effort levels including "Default"
+  const effortDefsTarget = 'EOu=["low","medium","high"],U5n={low:"Low",medium:"Medium",high:"High"},yOu=new Map,SOu=/^(.*?)\\s*\\((low|medium|high)(?:\\s+thinking)?\\)\\s*$/i';
+  const effortDefsReplacement = 'EOu=["default","low","medium","high"],U5n={default:"Default",low:"Low",medium:"Medium",high:"High"},yOu=new Map,SOu=/^(.*?)\\s*\\((default|low|medium|high)(?:\\s+thinking)?\\)\\s*$/i';
+  if (wbCode.includes(effortDefsTarget)) {
+    wbCode = wbCode.replace(effortDefsTarget, effortDefsReplacement);
+    console.log('   OK - workbench.desktop.main.js (EOu/U5n/SOu) patched with Default effort level');
+  } else if (wbCode.includes('default:"Default"')) {
+    console.log('   OK - workbench.desktop.main.js (EOu/U5n/SOu) already patched with Default effort level');
+  }
+
+  // B. Patch qZe so custom models can utilize effort submenus
+  const qzeTarget = 'qZe=t=>{if(!t.isCustom)return yOu.get(t.value)??COu(t.label)}';
+  const qzeReplacement = 'qZe=t=>yOu.get(t.value)??COu(t.label)';
+  if (wbCode.includes(qzeTarget)) {
+    wbCode = wbCode.replace(qzeTarget, qzeReplacement);
+    console.log('   OK - workbench.desktop.main.js (qZe) patched for custom models');
+  } else if (wbCode.includes(qzeReplacement)) {
+    console.log('   OK - workbench.desktop.main.js (qZe) already patched for custom models');
+  }
+
+  // C. Patch DQo group builder (supports initial, effort variants, and re-patching)
   const dqoRegex = /DQo=\(t,e\)=>\{[\s\S]*?o\.options\.length>0&&r\.groups\.push\(o\)\}\),r\}\)\}/;
-  const dqoReplacement = `DQo=(t,e)=>{const _custom=${customModelsJsonLiteral};let i=new Map;t.forEach(n=>{let r=wpt(n);r&&i.set(n.label,r)});for(const _m of _custom){if(!_m.name&&!_m.displayName)continue;const _lbl=_m.displayName||_m.name;if(!i.has(_lbl)){let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1001+(Math.abs(_h)%350);i.set(_lbl,{label:_lbl,value:_ph,disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0})}}return e.map(n=>{let r={name:n.name,groups:[]};return n.groups.forEach(s=>{let o={groupName:s.groupName,options:[]};s.modelLabels.forEach(a=>{let l=i.get(a);l&&o.options.push(l)});for(const _m of _custom){const _lbl=_m.displayName||_m.name;const _item=i.get(_lbl);if(_item&&!o.options.some(_x=>_x.label===_lbl))o.options.push(_item)}o.options.length>0&&r.groups.push(o)}),r})}`;
+  const dqoReplacement = `DQo=(t,e)=>{const _custom=${customModelsJsonLiteral};let i=new Map;t.forEach(n=>{let r=wpt(n);r&&i.set(n.label,r)});for(const _m of _custom){if(!_m.name&&!_m.displayName)continue;const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];for(const _l of _lvls){const _lbl=_l?\`\${_m.displayName||_m.name} (\${_l})\`:(_m.displayName||_m.name);if(!i.has(_lbl)){let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1001+(Math.abs(_h)%350);i.set(_lbl,{label:_lbl,value:_ph,disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0})}}}return e.map(n=>{let r={name:n.name,groups:[]};return n.groups.forEach(s=>{let o={groupName:s.groupName,options:[]};s.modelLabels.forEach(a=>{let l=i.get(a);l&&o.options.push(l)});for(const _m of _custom){const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];for(const _l of _lvls){const _lbl=_l?\`\${_m.displayName||_m.name} (\${_l})\`:(_m.displayName||_m.name);const _item=i.get(_lbl);if(_item&&!o.options.some(_x=>_x.label===_lbl))o.options.push(_item)}}o.options.length>0&&r.groups.push(o)}),r})}`;
 
   if (dqoRegex.test(wbCode)) {
     wbCode = wbCode.replace(dqoRegex, dqoReplacement);
@@ -46,9 +66,9 @@ if (fs.existsSync(wbPath)) {
     console.warn('   WARN - DQo target not found in workbench.desktop.main.js');
   }
 
-  // B. Patch y in wqt() so the Cascade state manager retains custom model selections without resetting
+  // D. Patch y in wqt() so the Cascade state manager retains custom model selections without resetting
   const yRegex = /y=Re\(\(\)=>(\{const _custom=[\s\S]*?return\[\.\.\.\(o\?\.cascadeModelConfigData\?\.clientModelConfigs\|\|\[\]\)\.map\(wpt\)\.filter\(A=>A!==null\)\.filter\(A=>!A\.disabled\),[\s\S]*?\]\}|\(o\?\.cascadeModelConfigData\?\.clientModelConfigs\|\|\[\]\)\.map\(wpt\)\.filter\(A=>A!==null\)\.filter\(A=>!A\.disabled\)),\[o\?\.cascadeModelConfigData\]\)/;
-  const yReplacement = `y=Re(()=>{const _custom=${customModelsJsonLiteral};const _cList=_custom.map(_m=>{const _lbl=_m.displayName||_m.name;let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;return{label:_lbl,value:1001+(Math.abs(_h)%350),disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0}});return[...(o?.cascadeModelConfigData?.clientModelConfigs||[]).map(wpt).filter(A=>A!==null).filter(A=>!A.disabled),..._cList]},[o?.cascadeModelConfigData])`;
+  const yReplacement = `y=Re(()=>{const _custom=${customModelsJsonLiteral};const _cList=[];_custom.forEach(_m=>{const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];_lvls.forEach(_l=>{const _lbl=_l?\`\${_m.displayName||_m.name} (\${_l})\`:(_m.displayName||_m.name);let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;_cList.push({label:_lbl,value:1001+(Math.abs(_h)%350),disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0})})});return[...(o?.cascadeModelConfigData?.clientModelConfigs||[]).map(wpt).filter(A=>A!==null).filter(A=>!A.disabled),..._cList]},[o?.cascadeModelConfigData])`;
 
   if (yRegex.test(wbCode)) {
     wbCode = wbCode.replace(yRegex, yReplacement);
@@ -57,16 +77,16 @@ if (fs.existsSync(wbPath)) {
     console.warn('   WARN - yTarget not found in workbench.desktop.main.js');
   }
 
-  // C. Patch h in Goe() provider as well
+  // E. Patch h in Goe() provider as well
   const hRegex = /h=Re\(\(\)=>(\{const _custom=[\s\S]*?return\[\.\.\.\(e\?\.cascadeModelConfigData\?\.clientModelConfigs\|\|\[\]\)\.map\(wpt\)\.filter\(_=>_!==null\)\.filter\(_=>!_\.disabled\),[\s\S]*?\.\.\.u\]\}|\[\.\.\.\(e\?\.cascadeModelConfigData\?\.clientModelConfigs\|\|\[\]\)\.map\(wpt\)\.filter\(_=>_!==null\)\.filter\(_=>!_\.disabled\),\.\.\.u\]),\[e\?\.cascadeModelConfigData,u\]\)/;
-  const hReplacement = `h=Re(()=>{const _custom=${customModelsJsonLiteral};const _cList=_custom.map(_m=>{const _lbl=_m.displayName||_m.name;let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;return{label:_lbl,value:1001+(Math.abs(_h)%350),disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0}});return[...(e?.cascadeModelConfigData?.clientModelConfigs||[]).map(wpt).filter(_=>_!==null).filter(_=>!_.disabled),..._cList,...u]},[e?.cascadeModelConfigData,u])`;
+  const hReplacement = `h=Re(()=>{const _custom=${customModelsJsonLiteral};const _cList=[];_custom.forEach(_m=>{const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];_lvls.forEach(_l=>{const _lbl=_l?\`\${_m.displayName||_m.name} (\${_l})\`:(_m.displayName||_m.name);let _in=_lbl.toLowerCase(),_h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;_cList.push({label:_lbl,value:1001+(Math.abs(_h)%350),disabled:!1,supportedMimeTypes:new Map([["image/png",!0],["image/jpeg",!0]]),isCustom:!0})})});return[...(e?.cascadeModelConfigData?.clientModelConfigs||[]).map(wpt).filter(_=>_!==null).filter(_=>!_.disabled),..._cList,...u]},[e?.cascadeModelConfigData,u])`;
 
   if (hRegex.test(wbCode)) {
     wbCode = wbCode.replace(hRegex, hReplacement);
     console.log(`   OK - workbench.desktop.main.js (Goe visibleModelConfigs) patched with ${customModels.length} custom model(s)`);
   }
 
-  // D. Expand max-h on POu model selector panel so submenu is never clipped by overflow-hidden
+  // F. Expand max-h on POu model selector panel so submenu is never clipped by overflow-hidden
   const pouTarget = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-80 overflow-hidden outline-none"';
   const pouReplacement = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-[580px] outline-none"';
 
@@ -94,9 +114,9 @@ if (fs.existsSync(mainPath)) {
   }
 
 
-  // B. Patch r2l(e) model state injection hook
+  // B. Patch r2l(e) model state injection hook (with effort variants)
   const r2lTargetRegex = /function\s+r2l\s*\(e\)\s*\{\s*(try\{.*?catch\(_err\)\{\}\s*)?const\s+t\s*=\s*e\.models\s*,\s*r\s*=\s*new\s+Set\s*;/;
-  const r2lReplacement = `function r2l(e){try{const _fs=require("fs"),_path=require("path"),_os=require("os"),_cp=_path.join(_os.homedir(),".gemini","antigravity-ide","custom_models.json");if(_fs.existsSync(_cp)){const _cm=JSON.parse(_fs.readFileSync(_cp,"utf8")),_list=Array.isArray(_cm)?_cm:(_cm.models||[]);if(!e.agentModelSorts||!e.agentModelSorts.length)e.agentModelSorts=[{displayName:"Recommended",groups:[{displayName:"",modelIds:[]}]}];const _rec=e.agentModelSorts[0].groups[0];for(const _m of _list){if(!_m.name&&!_m.displayName)continue;let _raw=(_m.externalModelName||_m.name||"custom-model").replace(/^models\\//,"").replace(/[^a-zA-Z0-9]+/g,"-").replace(/^-+|-+$/g,"").toLowerCase();let _s="custom-"+_raw;let _in=(_m.displayName||_m.name||"custom-model").toLowerCase();let _h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1001+(Math.abs(_h)%350);e.models[_s]={displayName:_m.displayName||_m.name,model:_ph,supportsImages:!0,recommended:!0,maxTokens:1048576,maxOutputTokens:32768,supportedMimeTypes:{}};if(!_rec.modelIds.includes(_s))_rec.modelIds.push(_s)}}}catch(_err){}const t=e.models,r=new Set;`;
+  const r2lReplacement = `function r2l(e){try{const _fs=require("fs"),_path=require("path"),_os=require("os"),_cp=_path.join(_os.homedir(),".gemini","antigravity-ide","custom_models.json");if(_fs.existsSync(_cp)){const _cm=JSON.parse(_fs.readFileSync(_cp,"utf8")),_list=Array.isArray(_cm)?_cm:(_cm.models||[]);if(!e.agentModelSorts||!e.agentModelSorts.length)e.agentModelSorts=[{displayName:"Recommended",groups:[{displayName:"",modelIds:[]}]}];const _rec=e.agentModelSorts[0].groups[0];for(const _m of _list){if(!_m.name&&!_m.displayName)continue;const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];for(const _l of _lvls){let _raw=(_m.externalModelName||_m.name||"custom-model").replace(/^models\\//,"").replace(/[^a-zA-Z0-9]+/g,"-").replace(/^-+|-+$/g,"").toLowerCase();let _s="custom-"+_raw+(_l?"-"+_l.toLowerCase():"");let _disp=(_m.displayName||_m.name||"custom-model")+(_l?" ("+_l+")":"");let _in=_disp.toLowerCase();let _h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1001+(Math.abs(_h)%350);e.models[_s]={displayName:_disp,model:_ph,supportsImages:!0,recommended:!0,maxTokens:1048576,maxOutputTokens:32768,supportedMimeTypes:{}};if(!_rec.modelIds.includes(_s))_rec.modelIds.push(_s)}}}}catch(_err){}const t=e.models,r=new Set;`;
 
   if (r2lTargetRegex.test(mainCode)) {
     mainCode = mainCode.replace(r2lTargetRegex, r2lReplacement);

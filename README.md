@@ -216,6 +216,16 @@ Models are configured in your user profile directory:
       "externalModelName": "claude-3-5-sonnet-latest"
     },
     {
+      "name": "models/o3-mini",
+      "displayName": "o3-mini (OpenAI)",
+      "description": "OpenAI o3-mini with configurable reasoning effort",
+      "provider": "openai",
+      "apiKey": "sk-proj-...",
+      "apiUrl": "https://api.openai.com/v1/chat/completions",
+      "externalModelName": "o3-mini",
+      "reasoningEffortLevels": ["Default", "Low", "Medium", "High"]
+    },
+    {
       "name": "models/llama3",
       "displayName": "Llama 3 (Local Ollama)",
       "description": "Local Llama 3 running on Ollama port 11434",
@@ -227,6 +237,13 @@ Models are configured in your user profile directory:
   ]
 }
 ```
+
+### Reasoning Effort Levels (`reasoningEffortLevels`)
+You can enable native Antigravity flyout effort submenus for any custom model by specifying `"reasoningEffortLevels"`:
+- **Supported Options**: `["Default", "Low", "Medium", "High"]` (or any subset, case-insensitive).
+- **OpenAI Compliance**: Maps `"low"`, `"medium"`, `"high"` directly to OpenAI's `reasoning_effort` API parameter.
+- **"Default" / Omission Handling**: When `"Default"` is selected, the proxy completely omits the `reasoning_effort` parameter to maintain compatibility with standard endpoints or routers.
+- **Anthropic Support**: Automatically adjusts Claude thinking token budgets (`low`: 2,048, `medium`: 8,192, `high`: 16,384 tokens).
 
 ---
 

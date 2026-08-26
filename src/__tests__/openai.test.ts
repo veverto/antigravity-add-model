@@ -45,6 +45,25 @@ describe('mapGeminiToOpenAI', () => {
     expect(result.messages[0]).toEqual({ role: 'assistant', content: 'Hi there!', reasoning_content: '' });
   });
 
+  it('should include reasoning_effort for low, medium, high', () => {
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+    };
+    expect(mapGeminiToOpenAI(body, 'o3-mini', 'high').reasoning_effort).toBe('high');
+    expect(mapGeminiToOpenAI(body, 'o3-mini', 'Medium').reasoning_effort).toBe('medium');
+    expect(mapGeminiToOpenAI(body, 'o3-mini', 'LOW').reasoning_effort).toBe('low');
+  });
+
+  it('should omit reasoning_effort when effort is default, undefined, or empty', () => {
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+    };
+    expect(mapGeminiToOpenAI(body, 'o3-mini', 'Default').reasoning_effort).toBeUndefined();
+    expect(mapGeminiToOpenAI(body, 'o3-mini', 'default').reasoning_effort).toBeUndefined();
+    expect(mapGeminiToOpenAI(body, 'o3-mini').reasoning_effort).toBeUndefined();
+    expect(mapGeminiToOpenAI(body, 'gpt-4o').reasoning_effort).toBeUndefined();
+  });
+
   it('should handle functionCall parts as tool_calls', () => {
     const body = {
       contents: [
