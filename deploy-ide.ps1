@@ -124,6 +124,7 @@ if (Test-Path $ideLs) {
     }
 }
 
+
 # 7. Launch Antigravity IDE
 Write-Host "[6/6] Launching Antigravity IDE..." -ForegroundColor Yellow
 $IdeExePath = "$env:LOCALAPPDATA\Programs\Antigravity IDE\Antigravity IDE.exe"

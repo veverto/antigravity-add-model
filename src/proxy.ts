@@ -87,7 +87,7 @@ function generateModelPlaceholderId(modelOrName: CustomModel | string, suffix = 
     hash = (hash << 5) + hash + input.charCodeAt(i);
     hash = hash & hash; // Force 32-bit integer
   }
-  const placeholderNum = 1 + (Math.abs(hash) % 350);
+  const placeholderNum = 351 + (Math.abs(hash) % 290);
   return `MODEL_PLACEHOLDER_M${placeholderNum}`;
 }
 
