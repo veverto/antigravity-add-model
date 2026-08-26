@@ -22,8 +22,9 @@ vi.mock('electron-log', () => ({
 
 // ─── Test: generateModelPlaceholderId (via concept) ────────────────────────
 
-function generateModelPlaceholderId(model: { displayName?: string; name?: string }): string {
-  const input = (model.displayName || model.name || 'custom-model').toLowerCase();
+function generateModelPlaceholderId(modelOrName: { displayName?: string; name?: string } | string, suffix = ''): string {
+  const str = typeof modelOrName === 'string' ? modelOrName : (modelOrName.displayName || modelOrName.name || 'custom-model');
+  const input = (str + (suffix ? ` (${suffix})` : '')).toLowerCase();
   let hash = 5381;
   for (let i = 0; i < input.length; i++) {
     hash = (hash << 5) + hash + input.charCodeAt(i);
@@ -116,6 +117,14 @@ describe('generateModelPlaceholderId', () => {
     const id1 = generateModelPlaceholderId({ name: 'GPT-4O' });
     const id2 = generateModelPlaceholderId({ name: 'gpt-4o' });
     expect(id1).toBe(id2);
+  });
+
+  it('generates distinct placeholders for reasoning effort variants', () => {
+    const baseId = generateModelPlaceholderId({ displayName: 'Kimi k3' });
+    const highId = generateModelPlaceholderId({ displayName: 'Kimi k3' }, 'High');
+    const lowId = generateModelPlaceholderId({ displayName: 'Kimi k3' }, 'Low');
+    expect(highId).not.toBe(baseId);
+    expect(lowId).not.toBe(highId);
   });
 });
 

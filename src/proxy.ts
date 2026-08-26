@@ -79,8 +79,9 @@ const cryptoStore = require('./cryptoStore');
 
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
-function generateModelPlaceholderId(model: CustomModel): string {
-  const input = (model.displayName || model.name || 'custom-model').toLowerCase();
+function generateModelPlaceholderId(modelOrName: CustomModel | string, suffix = ''): string {
+  const str = typeof modelOrName === 'string' ? modelOrName : (modelOrName.displayName || modelOrName.name || 'custom-model');
+  const input = (str + (suffix ? ` (${suffix})` : '')).toLowerCase();
   let hash = 5381;
   for (let i = 0; i < input.length; i++) {
     hash = (hash << 5) + hash + input.charCodeAt(i);
@@ -213,12 +214,18 @@ function matchCustomModelWithEffort(
       const effortSuffix = `-${lvl.toLowerCase()}`;
       const effortSlug = `${baseSlug}${effortSuffix}`;
       const effortName = `${baseName}${effortSuffix}`;
+      const effortPlaceholder = generateModelPlaceholderId(m, lvl).toLowerCase();
+      const effortEnumInt = (1000 + parseInt(effortPlaceholder.split('_M')[1], 10)).toString();
 
       if (
         cleanTarget === effortSlug ||
         cleanTarget === effortName ||
+        cleanTarget === effortPlaceholder ||
+        cleanTarget === effortEnumInt ||
         cleanTargetId === effortSlug ||
-        cleanTargetId === effortName
+        cleanTargetId === effortName ||
+        cleanTargetId === effortPlaceholder ||
+        cleanTargetId === effortEnumInt
       ) {
         return {
           ...m,
@@ -1352,11 +1359,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                   for (const lvl of levels) {
                     const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
                     const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
+                    const placeholder = generateModelPlaceholderId(m, lvl || '');
                     (result as Record<string, unknown>)[slug] = {
                       ...baseEntry,
+                      model: placeholder,
                       displayName: disp,
                     };
-                    log.info(`[Proxy] Custom model "${disp}" => slug: ${slug}`);
+                    log.info(`[Proxy] Custom model "${disp}" => slug: ${slug}, placeholder: ${placeholder}`);
                   }
                   m._slug = baseSlug;
                 });
@@ -1404,6 +1413,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
                   const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
                   mappedCustom[slug] = {
                     ...googleModelTemplate,
+                    model: generateModelPlaceholderId(m, lvl || ''),
                     displayName: disp,
                   };
                 }
@@ -1464,17 +1474,22 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             const mappedCustom: Record<string, unknown> = {};
             const fallbackIds: string[] = [];
             customModels.forEach((m) => {
-              const slug = toSlug(m);
-              const placeholder = generateModelPlaceholderId(m);
-              fallbackIds.push(slug, placeholder);
-              mappedCustom[slug] = {
-                displayName: m.displayName,
-                maxTokens: 1048576,
-                maxOutputTokens: 4096,
-                model: placeholder,
-                apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-                modelProvider: 'MODEL_PROVIDER_GOOGLE',
-              };
+              const baseSlug = toSlug(m);
+              const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
+              for (const lvl of levels) {
+                const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
+                const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
+                const placeholder = generateModelPlaceholderId(m, lvl || '');
+                fallbackIds.push(slug, placeholder);
+                mappedCustom[slug] = {
+                  displayName: disp,
+                  maxTokens: 1048576,
+                  maxOutputTokens: 4096,
+                  model: placeholder,
+                  apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+                  modelProvider: 'MODEL_PROVIDER_GOOGLE',
+                };
+              }
             });
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
@@ -1491,17 +1506,22 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         const mappedCustom: Record<string, unknown> = {};
         const fallbackIds: string[] = [];
         customModels.forEach((m) => {
-          const slug = toSlug(m);
-          const placeholder = generateModelPlaceholderId(m);
-          fallbackIds.push(slug, placeholder);
-          mappedCustom[slug] = {
-            displayName: m.displayName,
-            maxTokens: 1048576,
-            maxOutputTokens: 4096,
-            model: placeholder,
-            apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
-            modelProvider: 'MODEL_PROVIDER_GOOGLE',
-          };
+          const baseSlug = toSlug(m);
+          const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
+          for (const lvl of levels) {
+            const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
+            const disp = (m.displayName || m.name || 'Custom Model') + (lvl ? ` (${lvl})` : '');
+            const placeholder = generateModelPlaceholderId(m, lvl || '');
+            fallbackIds.push(slug, placeholder);
+            mappedCustom[slug] = {
+              displayName: disp,
+              maxTokens: 1048576,
+              maxOutputTokens: 4096,
+              model: placeholder,
+              apiProvider: 'API_PROVIDER_GOOGLE_GEMINI',
+              modelProvider: 'MODEL_PROVIDER_GOOGLE',
+            };
+          }
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
