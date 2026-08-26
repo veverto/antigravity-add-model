@@ -30,7 +30,7 @@ Auto Switch targets.
 The policy is stored separately from model credentials at:
 
 ```text
-~/.gemini/antigravity/gravity_auto_switch.json
+~/.gemini/antigravity-ide/gravity_auto_switch.json
 ```
 
 It contains model references and routing settings—not API keys. API keys remain

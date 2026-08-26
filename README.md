@@ -181,7 +181,7 @@ The deploy script will:
 ## Model Configuration (`custom_models.json`)
 
 Models are configured in your user profile directory:
-- **Path**: `~/.gemini/antigravity/custom_models.json` (e.g. `C:\Users\<Username>\.gemini\antigravity\custom_models.json`)
+- **Path**: `~/.gemini/antigravity-ide/custom_models.json` (e.g. `C:\Users\<Username>\.gemini\antigravity-ide\custom_models.json`)
 
 ### Example Configuration:
 

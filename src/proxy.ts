@@ -89,7 +89,7 @@ function generateModelPlaceholderId(model: CustomModel): string {
 }
 
 function getCustomModelsPath(): string {
-  const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity');
+  const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
   return path.join(geminiDir, 'custom_models.json');
 }
 
@@ -1391,7 +1391,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             }
 
             try {
-              require('fs').writeFileSync(require('path').join(require('os').homedir(), '.gemini', 'antigravity', 'fetch_response.json'), JSON.stringify(googleJson, null, 2));
+              require('fs').writeFileSync(require('path').join(require('os').homedir(), '.gemini', 'antigravity-ide', 'fetch_response.json'), JSON.stringify(googleJson, null, 2));
             } catch (e) {
               log.error('[Proxy] Failed to write fetch_response.json', e);
             }

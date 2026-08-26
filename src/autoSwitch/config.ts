@@ -6,7 +6,7 @@ import { validateAutoSwitchPolicy } from './validator';
 export const AUTO_SWITCH_CONFIG_FILE = 'gravity_auto_switch.json';
 
 export function getAutoSwitchConfigPath(homeDir: string): string {
-  return path.join(homeDir, '.gemini', 'antigravity', AUTO_SWITCH_CONFIG_FILE);
+  return path.join(homeDir, '.gemini', 'antigravity-ide', AUTO_SWITCH_CONFIG_FILE);
 }
 
 export function loadAutoSwitchPolicy(filePath: string): AutoSwitchPolicy {

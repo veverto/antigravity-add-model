@@ -4,7 +4,7 @@ import os from 'os';
 import { LS_LOG_FILE_NAME } from './constants';
 
 export function getAppDataDirName(): string {
-  return `antigravity${app.isPackaged ? '' : '-dev'}`;
+  return `antigravity-ide${app.isPackaged ? '' : '-dev'}`;
 }
 
 export function getAppDataDir(): string {

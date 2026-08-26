@@ -110,7 +110,7 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
     await storageManager.updateItems(changes);
   });
   ipcMain.handle('storage:get-custom-models', async () => {
-    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity');
+    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
     const filePath = path.join(geminiDir, 'custom_models.json');
     try {
       const content = await fs.readFile(filePath, 'utf-8');
@@ -139,7 +139,7 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   });
 
   ipcMain.handle('storage:save-custom-model', async (_event, newModel: CustomModelFileEntry & { apiKey?: string }) => {
-    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity');
+    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
     const filePath = path.join(geminiDir, 'custom_models.json');
     try {
       let models: CustomModelFileEntry[] = [];
@@ -148,34 +148,39 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
         const parsed = JSON.parse(content) as { models?: CustomModelFileEntry[] };
         models = parsed.models || [];
       } catch {
-        // Ignore if file doesn't exist
+        // File doesn't exist yet, start with empty list
       }
 
-      // Check if model already exists, if so update it, otherwise push
-      const existingIdx = models.findIndex((m) => m.name === newModel.name);
+      // If updating existing, find index
+      const existingIndex = models.findIndex((m) => m.name === newModel.name);
 
-      // Edit collision protection: If new key is masked and old record exists, preserve old encrypted key
-      const isMasked =
-        newModel.apiKey &&
-        (newModel.apiKey.includes('...') || newModel.apiKey.startsWith('***') || newModel.apiKey === '********');
-      if (isMasked && existingIdx !== -1) {
-        newModel.apiKey = models[existingIdx].apiKey;
-        newModel.encrypted = models[existingIdx].encrypted;
-      } else {
-        if (newModel.apiKey && newModel.apiKey !== 'none') {
-          newModel.apiKey = cryptoStore.encryptString(newModel.apiKey);
-          newModel.encrypted = true;
+      let keyToStore = newModel.apiKey || 'none';
+      if (keyToStore && keyToStore !== 'none') {
+        // If it's already encrypted, keep it. If it's plaintext, encrypt it.
+        if (!keyToStore.startsWith('enc:') && !keyToStore.startsWith('fallback:')) {
+          keyToStore = cryptoStore.encryptString(keyToStore);
         }
       }
 
-      if (existingIdx !== -1) {
-        models[existingIdx] = newModel;
+      const modelEntry: CustomModelFileEntry = {
+        ...newModel,
+        apiKey: keyToStore,
+      };
+
+      if (existingIndex >= 0) {
+        // Update existing, but preserve existing encrypted key if UI sent masked key back
+        if (newModel.apiKey && newModel.apiKey.includes('...')) {
+          modelEntry.apiKey = models[existingIndex].apiKey;
+        }
+        models[existingIndex] = modelEntry;
       } else {
-        models.push(newModel);
+        models.push(modelEntry);
       }
 
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      // Ensure directory exists
+      await fs.mkdir(geminiDir, { recursive: true });
       await fs.writeFile(filePath, JSON.stringify({ models }, null, 2), 'utf-8');
+
       return { success: true };
     } catch (err) {
       console.error('[IPC] Failed to save custom model:', err);
@@ -184,7 +189,7 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
   });
 
   ipcMain.handle('storage:delete-custom-model', async (_event, modelName: string) => {
-    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity');
+    const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
     const filePath = path.join(geminiDir, 'custom_models.json');
     try {
       let models: CustomModelFileEntry[] = [];
@@ -487,7 +492,7 @@ interface ReverifyResult {
 }
 
 function getCustomModelsPath(): string {
-  return path.join(app.getPath('home'), '.gemini', 'antigravity', 'custom_models.json');
+  return path.join(app.getPath('home'), '.gemini', 'antigravity-ide', 'custom_models.json');
 }
 
 async function readStoredModels(): Promise<CustomModelFileEntry[]> {
