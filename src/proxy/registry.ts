@@ -18,7 +18,7 @@ export interface TranslatorModule {
   mapGeminiToOpenAI?: (body: unknown, modelName: string, effort?: string) => unknown;
   mapOpenAIToGemini?: (res: unknown, modelName: string) => unknown;
   mapOpenAIChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
-  mapGeminiToAnthropic?: (body: unknown, modelName: string, effort?: string) => unknown;
+  mapGeminiToAnthropic?: (body: unknown, modelName: string) => unknown;
   mapAnthropicToGemini?: (res: unknown, modelName: string) => unknown;
   mapAnthropicChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
   mapGeminiToGoogle?: (body: unknown, modelName: string, effort?: string) => unknown;
@@ -89,7 +89,7 @@ export function translateRequest(provider: string, geminiBody: unknown, modelNam
 
   if (provider === 'google') return geminiBody;
   if (OPENAI_COMPAT.has(provider)) return t?.mapGeminiToOpenAI ? t.mapGeminiToOpenAI(geminiBody, modelName, effort) : geminiBody;
-  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName, effort) : geminiBody;
+  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName) : geminiBody;
 
   // Generic: try mapGeminiTo<Provider> convention
   const fnName = `mapGeminiTo${provider.charAt(0).toUpperCase() + provider.slice(1)}`;

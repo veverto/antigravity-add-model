@@ -243,7 +243,6 @@ You can enable native Antigravity flyout effort submenus for any custom model by
 - **Supported Options**: `["Default", "Low", "Medium", "High"]` (or any subset, case-insensitive).
 - **OpenAI Compliance**: Maps `"low"`, `"medium"`, `"high"` directly to OpenAI's `reasoning_effort` API parameter.
 - **"Default" / Omission Handling**: When `"Default"` is selected, the proxy completely omits the `reasoning_effort` parameter to maintain compatibility with standard endpoints or routers.
-- **Anthropic Support**: Automatically adjusts Claude thinking token budgets (`low`: 2,048, `medium`: 8,192, `high`: 16,384 tokens).
 
 ---
 

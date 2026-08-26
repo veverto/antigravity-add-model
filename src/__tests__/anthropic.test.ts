@@ -51,32 +51,6 @@ describe('mapGeminiToAnthropic', () => {
     expect(result.messages[0]).toEqual({ role: 'assistant', content: 'Hi!' });
   });
 
-  it('should configure thinking budget for low, medium, high effort', () => {
-    const body = {
-      contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
-    };
-    const highRes = mapGeminiToAnthropic(body, 'claude-3-7-sonnet-latest', 'high');
-    expect(highRes.thinking).toEqual({ type: 'enabled', budget_tokens: 16384 });
-    expect(highRes.temperature).toBeUndefined();
-
-    const medRes = mapGeminiToAnthropic(body, 'claude-3-7-sonnet-latest', 'Medium');
-    expect(medRes.thinking).toEqual({ type: 'enabled', budget_tokens: 8192 });
-
-    const lowRes = mapGeminiToAnthropic(body, 'claude-3-7-sonnet-latest', 'LOW');
-    expect(lowRes.thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
-  });
-
-  it('should omit thinking configuration when effort is Default or undefined', () => {
-    const body = {
-      contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
-    };
-    const defRes = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest', 'Default');
-    expect(defRes.thinking).toBeUndefined();
-
-    const noneRes = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
-    expect(noneRes.thinking).toBeUndefined();
-  });
-
   it('should convert functionCall to tool_use content blocks', () => {
     const body = {
       contents: [
