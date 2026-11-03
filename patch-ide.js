@@ -658,7 +658,35 @@ if (fs.existsSync(jetskiAgentPath)) {
     console.log('   OK - jetskiAgent (rOr) already patched');
   }
 
-  // J. Inject modalCode.js
+  // J. iCn: Cascade Chat Model Selector unlock & live disk sync (Antigravity v2.6.0 primary selector)
+  const icnInitTarget = 'E=s.osName==="linux"&&s.isGoogleInternal,m=s.isGoogleInternal,[g,p]=j(null),';
+  const icnInitReplacement = 'E=!0,m=!0,[g,p]=j(null),[_dv,_sdv]=j(0);ge(()=>{window.__agy_onModelsUpdated=()=>_sdv(v=>v+1);const _iv=setInterval(()=>{_fetchCustomModelsAsync?.(()=>{_sdv(v=>v+1)})},3000);return ()=>{clearInterval(_iv);delete window.__agy_onModelsUpdated}},[]);let ';
+  if (jsCode.includes(icnInitTarget)) {
+    jsCode = jsCode.replace(icnInitTarget, icnInitReplacement);
+    console.log('   OK - jetskiAgent (iCn cascade chat model selector) unlocked (E=true, m=true, live disk sync)');
+  } else if (jsCode.includes('E=!0,m=!0,[g,p]=j(null)')) {
+    console.log('   OK - jetskiAgent (iCn) already unlocked');
+  }
+
+  const icnModelsTarget = 'R=z(()=>{let S=lzr(l);for(let N of S)N.disabled=!E;return S},[l,E]),';
+  const icnModelsReplacement = 'R=z(()=>{let S=lzr(l);for(let N of S)N.disabled=!1;return S},[l,E,_dv]),';
+  if (jsCode.includes(icnModelsTarget)) {
+    jsCode = jsCode.replace(icnModelsTarget, icnModelsReplacement);
+    console.log('   OK - jetskiAgent (iCn custom models list) un-disabled');
+  } else if (jsCode.includes('N.disabled=!1;return S},[l,E,_dv]')) {
+    console.log('   OK - jetskiAgent (iCn models) already un-disabled');
+  }
+
+  const icnSelectTarget = 'let I=S.value===Zc.GOOGLE_GEMINI_INTERNAL_BYOM;p(I?S.label:null);let F=bzi(S),L;if(I){let Z=$at(S.label,l);Z&&(L=Z)}i?.(F,L,N)';
+  const icnSelectReplacement = 'let I=S.value===Zc.GOOGLE_GEMINI_INTERNAL_BYOM||!!S.isCustom;p(I?S.label:null);let F=bzi(S),L;if(I){let Z=$at(S.label,l);Z&&(L=Z);try{fetch("http://127.0.0.1:50999/v1internal/selectModel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:S.label,isCustom:I,override:Z,native:!I})}).catch(()=>{})}catch(_e){}}else{try{fetch("http://127.0.0.1:50999/v1internal/selectModel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:S.label,isCustom:!1,native:!0})}).catch(()=>{})}catch(_e){}}i?.(F,L,N)';
+  if (jsCode.includes(icnSelectTarget)) {
+    jsCode = jsCode.replace(icnSelectTarget, icnSelectReplacement);
+    console.log('   OK - jetskiAgent (iCn model selection notifier) patched');
+  } else if (jsCode.includes('GOOGLE_GEMINI_INTERNAL_BYOM||!!S.isCustom')) {
+    console.log('   OK - jetskiAgent (iCn selection notifier) already patched');
+  }
+
+  // K. Inject modalCode.js
   const modalCodePath = path.join(__dirname, 'modalCode.js');
   if (fs.existsSync(modalCodePath)) {
     const modalMarker = '// AGY_ADD_MODEL_MODAL_INJECTED';
