@@ -686,6 +686,16 @@ if (fs.existsSync(jetskiAgentPath)) {
     console.log('   OK - jetskiAgent (iCn selection notifier) already patched');
   }
 
+  // J2. Unlock native View Usage (showModelUsage gating)
+  const showModelUsageTarget = '("inputComponent")?.showModelUsage===!0';
+  const showModelUsageReplacement = '("inputComponent")?.showModelUsage!==!1';
+  if (jsCode.includes(showModelUsageTarget)) {
+    jsCode = jsCode.replaceAll(showModelUsageTarget, showModelUsageReplacement);
+    console.log('   OK - jetskiAgent (showModelUsage) unlocked for native View Usage');
+  } else if (jsCode.includes(showModelUsageReplacement)) {
+    console.log('   OK - jetskiAgent (showModelUsage) already unlocked');
+  }
+
   // K. Inject modalCode.js
   const modalCodePath = path.join(__dirname, 'modalCode.js');
   if (fs.existsSync(modalCodePath)) {
