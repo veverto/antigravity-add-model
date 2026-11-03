@@ -12,6 +12,8 @@ const appDir = process.argv[2]
 const mainPath = path.join(appDir, 'out', 'main.js');
 const wbPath = path.join(appDir, 'out', 'vs', 'workbench', 'workbench.desktop.main.js');
 const wbCssPath = path.join(appDir, 'out', 'vs', 'workbench', 'workbench.desktop.main.css');
+const jetskiAgentPath = path.join(appDir, 'out', 'jetskiAgent', 'main.js');
+const jetskiCssPath = path.join(appDir, 'out', 'jetskiMain.tailwind.css');
 const productPath = path.join(appDir, 'product.json');
 const lsBinaryName = process.platform === 'win32' ? 'language_server_windows_x64.exe' : 'language_server_linux_x64';
 const lsPath = path.join(appDir, 'extensions', 'antigravity', 'bin', lsBinaryName);
@@ -539,6 +541,176 @@ if (fs.existsSync(wbCssPath)) {
   }
 }
 
+// 1c. Patch out/jetskiAgent/main.js (Antigravity v2.6.0+ dedicated agent panel bundle)
+if (fs.existsSync(jetskiAgentPath)) {
+  console.log('[Patch-IDE] Detected Jetski Agent bundle: v2.6.0+ dedicated agent panel');
+  let jsCode = fs.readFileSync(jetskiAgentPath, 'utf8');
+
+  // A. Redux initial state unlocked
+  const azrTarget = 'azr={supported:!1,customModels:{}}';
+  const azrReplacement = 'azr={supported:!0,customModels:{}}';
+  if (jsCode.includes(azrTarget)) {
+    jsCode = jsCode.replace(azrTarget, azrReplacement);
+    console.log('   OK - jetskiAgent (azr initial state) unlocked (supported=true)');
+  } else if (jsCode.includes('azr={supported:!0')) {
+    console.log('   OK - jetskiAgent (azr initial state) already unlocked');
+  }
+
+  // B. Effort formatting and custom model effort parsing
+  const bteTarget = 'bte={low:"Low",medium:"Medium",high:"High",xhigh:"Extra",max:"Max"}';
+  const bteReplacement = 'bte={default:"Default",low:"Low",medium:"Medium",high:"High",xhigh:"Extra",max:"Max"}';
+  if (jsCode.includes(bteTarget)) {
+    jsCode = jsCode.replace(bteTarget, bteReplacement);
+    console.log('   OK - jetskiAgent (bte) effort dictionary patched with Default');
+  } else if (jsCode.includes('default:"Default",low:"Low"')) {
+    console.log('   OK - jetskiAgent (bte) already contains Default');
+  }
+
+  const byTarget = 'bY=e=>{if(!e.isCustom)return Tqa.get(e.value)??_qa(e.label)}';
+  const byReplacement = 'bY=e=>{let _eff=_qa(e.label);if(_eff)return _eff;if(!e.isCustom)return Tqa.get(e.value);return{base:e.label,effort:"medium"}}';
+  if (jsCode.includes(byTarget)) {
+    jsCode = jsCode.replace(byTarget, byReplacement);
+    console.log('   OK - jetskiAgent (bY) custom models effort parsing patched');
+  } else if (jsCode.includes('return{base:e.label,effort:"medium"}}')) {
+    console.log('   OK - jetskiAgent (bY) already patched');
+  }
+
+  // C. Dynamic loading of custom models from disk & live update sync
+  const lzrTarget = ',lzr=e=>e?.customModels?Object.entries(e.customModels).map(([t,r])=>({label:t,value:r.modelId,isCustom:!0,customModelUrl:r.modelName})):[],$at=(e,t)=>{if(t?.customModels)return t.customModels[e]}';
+  const lzrReplacement = `;var _cachedCustomModels=${customModelsJsonLiteral},_lastCustomFetch=0,_fetchingCustomModels=!1;var _fetchCustomModelsAsync=cb=>{if(_fetchingCustomModels)return;_fetchingCustomModels=!0;try{fetch("http://127.0.0.1:50999/v1internal/customModels").then(r=>r.json()).then(d=>{const _l=Array.isArray(d)?d:(d.models||[]);if(_l&&_l.length){const _old=JSON.stringify(_cachedCustomModels);const _new=JSON.stringify(_l);_cachedCustomModels=_l;if(_old!==_new){cb?.();try{window.__agy_onModelsUpdated?.()}catch(_){}}}}).catch(()=>{}).finally(()=>{_fetchingCustomModels=!1})}catch(_e){_fetchingCustomModels=!1}};try{window._fetchCustomModelsAsync=_fetchCustomModelsAsync}catch(_e){}try{_fetchCustomModelsAsync()}catch(_e){}var _getDiskCustomModels=()=>{const _now=Date.now();if(!_cachedCustomModels||_cachedCustomModels.length===0||_now-_lastCustomFetch>2500){_lastCustomFetch=_now;_fetchCustomModelsAsync()}return _cachedCustomModels||[]};var lzr=e=>{let _r=[],_d=_getDiskCustomModels();for(const _m of _d){const _lbl=_m.displayName||_m.name;if(_lbl)_r.push({label:_lbl,value:326,isCustom:!0,customModelUrl:_m.externalModelName||_m.name||_lbl,supportsThinking:_m.supportsThinking!==!1,provider:_m.provider||'Custom'})}if(e?.customModels){for(const[t,r]of Object.entries(e.customModels)){if(!_r.some(_x=>_x.label===t)){let matched=_d.find(x=>(x.displayName||x.name)===t||x.name===t||x.externalModelName===r.modelName);let prov=matched?.provider||r.provider||'Custom';_r.push({label:t,value:r.modelId||326,isCustom:!0,customModelUrl:r.modelName,supportsThinking:!0,provider:prov})}}}return _r},$at=(e,t)=>{if(t?.customModels&&t.customModels[e])return t.customModels[e];try{const _q=_qa(e);const _base=_q?.base||e;const _eff=_q?.effort;const _d=_getDiskCustomModels(),_m=_d.find(_x=>(_x.displayName||_x.name)===e||_x.name===e||(_x.displayName||_x.name)===_base);if(_m)return{modelId:326,apiProvider:1,chatModelName:_eff?((_m.displayName||_m.name)+" ("+bte[_eff]+")"):(_m.displayName||_m.name),modelName:_m.externalModelName||_m.name,maxTokens:(_m.maxTokens&&_m.maxTokens>64000?_m.maxTokens:1048576),effort:_eff,modelFeatures:{zeroShotCapable:!0,supportsImages:!0,supportsToolCalls:!0,supportsThinking:_m.supportsThinking!==!1}}}catch(_e){}return void 0}`;
+  if (jsCode.includes(lzrTarget)) {
+    jsCode = jsCode.replace(lzrTarget, lzrReplacement);
+    console.log('   OK - jetskiAgent (lzr/$at dynamic disk models & live sync) patched');
+  } else if (jsCode.includes('var _cachedCustomModels=')) {
+    console.log('   OK - jetskiAgent (lzr/$at) already patched');
+  }
+
+  // D. Xqa: Model item with effort submenu & pencil edit button
+  const xqaTarget = 'Xqa=({model:e,onEdit:t})=>{let{setSelectedModel:r,selectedModel:n}=GB(),i=n?.label===e.label,a=e.disabled??!1,o=Tr(),s=!a&&!!t;return d("div",{className:"group relative",children:[d(Rt.Item,{"data-testid":Aqa,"data-model-label":e.label,selected:i,disabled:a,className:s?"pr-8":void 0,onClick:()=>{a||r(e)},children:d("span",{className:ke("flex items-center gap-1.5 min-w-0",a?"text-muted-foreground":""),children:[d("span",{className:"truncate text-xs text-left",children:e.label}),d(uEt,{option:e})]})}),s&&d(Oe,{children:[d("button",{type:"button",tabIndex:-1,"data-tooltip-id":o,"aria-label":"Edit Model",className:"absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center rounded p-1 opacity-0 transition-opacity hover:bg-secondary group-hover:opacity-100",onClick:l=>{l.stopPropagation(),t?.(e)},children:d(de,{name:"edit",size:12})}),d(Yt,{id:o,children:"Edit Model"})]})]})},';
+  const xqaReplacement = 'Xqa=({model:e,onEdit:t})=>{let{setSelectedModel:r,selectedModel:n}=GB(),a=e.disabled??!1,o=Tr(),s=!a&&!!t;let _q=_qa(n?.label||""),_isSel=n?.label===e.label||_q?.base===e.label;let _currEffort=_q?.base===e.label?_q.effort:"medium";let _efforts=["low","medium","high"];let _setEffort=eff=>{r({...e,label:e.label+" ("+bte[eff]+")",effort:eff})};let _main=d(Rt.SubmenuRoot,{children:[d(Rt.SubmenuTrigger,{selected:_isSel,disabled:a,className:s?"pr-8":void 0,onClick:()=>{_setEffort(_currEffort)},children:[d("span",{className:ke("flex items-center gap-1.5 min-w-0",a?"text-muted-foreground":""),children:[d("span",{"data-testid":"model-selector-effort-group","data-model-base":e.label,className:"truncate text-xs text-left",children:[e.label,_isSel&&d("span",{className:"opacity-70",children:[" ",bte[_currEffort]]})]}),d(uEt,{option:e})]})]}),d(Rt.Content,{side:"right",align:"start",className:"min-w-40 p-1",children:d(Rt.RadioGroup,{value:_currEffort,onValueChange:_setEffort,children:_efforts.map(eff=>d(Rt.RadioItem,{value:eff,children:d("span",{"data-testid":"model-selector-effort-option","data-effort":eff,children:bte[eff]})},eff))})})]});return d("div",{className:"group relative",children:[_main,s&&d(Oe,{children:[d("button",{type:"button",tabIndex:-1,"data-tooltip-id":o,"aria-label":"Edit Model",className:"absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center rounded p-1 opacity-0 transition-opacity hover:bg-secondary group-hover:opacity-100 z-20",onClick:l=>{l.stopPropagation(),t?.(e)},children:d(de,{name:"edit",size:12})}),d(Yt,{id:o,children:"Edit Model"})]})]})},';
+  if (jsCode.includes(xqaTarget)) {
+    jsCode = jsCode.replace(xqaTarget, xqaReplacement);
+    console.log('   OK - jetskiAgent (Xqa) patched with effort submenu & edit button');
+  } else if (jsCode.includes('model-selector-effort-group')) {
+    console.log('   OK - jetskiAgent (Xqa) already patched');
+  }
+
+  // E. kqa: Custom models list with Provider Grouping and smart [+] buttons
+  const kqaTarget = 'kqa=({customModels:e,onAddCustomModel:t,onEditCustomModel:r})=>{let{supportsCustomModels:n}=GB(),i=Tr(),a=Tr();return e.length===0&&!t?null:d("div",{children:[d("div",{className:ke("group flex select-none items-center justify-between gap-1 p-1 pl-2 text-xs font-medium",t&&!n?"cursor-not-allowed":""),children:[d("span",{className:"opacity-50",children:"Custom"}),t&&(n?d(Oe,{children:[d("button",{onClick:t,tabIndex:-1,"data-testid":pqa,className:"cursor-pointer rounded-md p-1 opacity-50 hover:bg-secondary hover:opacity-100","data-tooltip-id":i,children:d(de,{name:"add",size:12})}),d(Yt,{id:i,children:"Add Model"})]}):d(Oe,{children:[d("div",{"data-tooltip-id":a,className:"hidden group-hover:block",children:d(de,{name:"warning",size:12,className:"shrink-0 fill-yellow-200 stroke-yellow-800"})}),d(Yt,{id:a,className:"max-w-[250px] whitespace-normal",children:"Custom models are only supported on Linux machines."})]}))]}),d("div",{className:"flex flex-col gap-px",children:e.map(o=>d(Xqa,{model:o,onEdit:r},o.label))})]})};';
+  const kqaTargetAlt = 'kqa=({customModels:e,onAddCustomModel:t,onEditCustomModel:r})=>{let{supportsCustomModels:n}=GB(),i=Tr(),a=Tr();return e.length===0&&!t?null:d("div",{children:[d("div",{className:ke("group flex select-none items-center justify-between gap-1 p-1 pl-2 text-xs font-medium",t&&!n?"cursor-not-allowed":""),children:[d("span",{className:"opacity-50",children:"Custom"}),t&&(n?d(Oe,{children:[d("button",{onClick:t,tabIndex:-1,"data-testid":pqa,className:"cursor-pointer rounded-md p-1 opacity-50 hover:bg-secondary hover:opacity-100","data-tooltip-id":i,children:d(de,{name:"add",size:12})}),d(Yt,{id:i,children:"Add Model"})]}):d(Oe,{children:[d("div",{"data-tooltip-id":a,className:"hidden group-hover:block",children:d(de,{name:"warning",size:12,className:"shrink-0 fill-yellow-200 stroke-yellow-800"})}),d(Yt,{id:a,className:"max-w-[250px] whitespace-normal",children:"Custom models are only supported on Linux machines."})]}))]}),d("div",{className:"flex flex-col gap-px",children:e.map(o=>d(Xqa,{model:o,onEdit:r},o.label))})]})},';
+  const kqaReplacement = `kqa=({customModels:e,onAddCustomModel:t,onEditCustomModel:r})=>{let{supportsCustomModels:n}=GB(),i=Tr();let _openAdd=(prov)=>{try{window.__agy_default_provider=(prov||'').toLowerCase()}catch(_){}t?.()};if(e.length===0){return t?d("div",{className:"pt-1 border-t border-border/40 mt-1",children:[d("button",{type:"button",onClick:()=>_openAdd(),className:"w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer",children:[d(de,{name:"add",size:13}),d("span",{children:"Add Custom Model..."})]})]}):null}let _groups={};const _pMap={openrouter:'OpenRouter',openai:'OpenAI',anthropic:'Anthropic',google:'Google',ollama:'Ollama',deepseek:'DeepSeek',groq:'Groq',mistral:'Mistral',cerebras:'Cerebras',kimi:'Kimi',fireworks:'Fireworks',lmstudio:'LM Studio',llamacpp:'llama.cpp',nvidia:'NVIDIA'};for(const _m of e){let _rawP=_m.provider||"Custom";let _p=_pMap[_rawP.toLowerCase()]||(_rawP.charAt(0).toUpperCase()+_rawP.slice(1));if(!_groups[_p])_groups[_p]=[];_groups[_p].push(_m)}let _sections=[];for(const[_prov,_models]of Object.entries(_groups)){_sections.push(d("div",{key:_prov,className:"flex flex-col gap-1 mt-1",children:[d("div",{className:"group flex select-none items-center justify-between gap-1 p-1 pl-2 text-xs font-medium",children:[d("span",{className:"opacity-60 font-semibold tracking-wide",children:_prov}),t&&n&&d(Oe,{children:[d("button",{onClick:()=>_openAdd(_models[0]?.provider||_prov),tabIndex:-1,className:"cursor-pointer rounded-md p-1 opacity-50 hover:bg-secondary hover:opacity-100","data-tooltip-id":i,children:d(de,{name:"add",size:12})}),d(Yt,{id:i,children:"Add "+_prov+" Model"})]})]}),d("div",{className:"flex flex-col gap-px",children:_models.map(o=>d(Xqa,{model:o,onEdit:r},o.label))})]}));}return d("div",{children:[..._sections,t&&d("div",{key:"_add_global",className:"pt-1 border-t border-border/40 mt-1.5",children:[d("button",{type:"button",onClick:()=>_openAdd(),className:"w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors cursor-pointer",children:[d(de,{name:"add",size:13}),d("span",{children:"Add Custom Model..."})]})]})]})};`;
+  if (jsCode.includes(kqaTarget)) {
+    jsCode = jsCode.replace(kqaTarget, kqaReplacement);
+    console.log('   OK - jetskiAgent (kqa) patched with provider grouping & [+] actions');
+  } else if (jsCode.includes(kqaTargetAlt)) {
+    jsCode = jsCode.replace(kqaTargetAlt, kqaReplacement);
+    console.log('   OK - jetskiAgent (kqa alt) patched with provider grouping & [+] actions');
+  } else if (jsCode.includes('Add Custom Model...')) {
+    console.log('   OK - jetskiAgent (kqa) already patched');
+  }
+
+  // F. qqa: Main chat model selector unlock and proxy notification
+  const qqaEndTarget = 'w=O(()=>{F(!1),T(void 0)},[]),{isGoogleInternal:G}=lo().product;return d("div",{className:`min-w-0 ${dte}`,children:[d(Tpn,{placement:e,selectedModel:m,setSelectedModel:p,modelSorts:h,modelOptions:f,userStatus:E,refreshModels:async()=>{N.refreshUserStatus()},open:C,setIsOpen:S,customModels:s,supportsCustomModels:l,showCustomModelHeader:G,onAddCustomModel:U,onEditCustomModel:B,bestOfNConfig:r,contextWindow:R,isModelListLoading:u,finalFocus:v?V:void 0}),d($0n,{isOpen:I,operation:L,onClose:w,modelName:x,customModelsState:y,pushCustomModelsUpdate:_,setSelectedModelConfig:p})]})';
+  const qqaEndReplacement = 'w=O(()=>{F(!1),T(void 0)},[]);let[_dv,_sdv]=j(0);ge(()=>{window.__agy_onModelsUpdated=()=>_sdv(v=>v+1);const _iv=setInterval(()=>{_fetchCustomModelsAsync(()=>{_sdv(v=>v+1)})},3000);return ()=>{clearInterval(_iv);delete window.__agy_onModelsUpdated}},[]);let _liveCustom=lzr({customModels:{}});ge(()=>{if(m){let I=m.value===Zc.GOOGLE_GEMINI_INTERNAL_BYOM||!!m.isCustom;let V=I?$at(m.label,{}):void 0;try{fetch("http://127.0.0.1:50999/v1internal/selectModel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:m.label,isCustom:I,override:V,native:!I})}).catch(()=>{})}catch(_e){}}},[m]);return d("div",{className:`min-w-0 ${dte}`,children:[d(Tpn,{placement:e,selectedModel:m,setSelectedModel:p,modelSorts:h,modelOptions:f,userStatus:E,refreshModels:async()=>{N.refreshUserStatus()},open:C,setIsOpen:S,customModels:_liveCustom,supportsCustomModels:!0,showCustomModelHeader:!0,onAddCustomModel:U,onEditCustomModel:B,bestOfNConfig:r,contextWindow:R,isModelListLoading:u,finalFocus:v?V:void 0}),d($0n,{isOpen:I,operation:L,onClose:w,modelName:x,customModelsState:y,pushCustomModelsUpdate:_,setSelectedModelConfig:p})]})';
+  if (jsCode.includes(qqaEndTarget)) {
+    jsCode = jsCode.replace(qqaEndTarget, qqaEndReplacement);
+    console.log('   OK - jetskiAgent (qqa chat model selector) unlocked (showCustomModelHeader=true, supportsCustomModels=true, live disk sync)');
+  } else if (jsCode.includes('customModels:_liveCustom')) {
+    console.log('   OK - jetskiAgent (qqa chat model selector) already unlocked');
+  }
+
+  const qqaSelectTarget = 'else console.error(`[Model Select] Invalid model label: ${D.label}`);g()?.focus()}';
+  const qqaSelectReplacement = 'else console.error(`[Model Select] Invalid model label: ${D.label}`);try{fetch("http://127.0.0.1:50999/v1internal/selectModel",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:D.label,isCustom:!!D.isCustom,override:$at(D.label,{}),native:!D.isCustom})}).catch(()=>{})}catch(_e){}g()?.focus()}';
+  if (jsCode.includes(qqaSelectTarget)) {
+    jsCode = jsCode.replace(qqaSelectTarget, qqaSelectReplacement);
+    console.log('   OK - jetskiAgent (qqa model selection proxy notifier) patched');
+  } else if (jsCode.includes('/v1internal/selectModel')) {
+    console.log('   OK - jetskiAgent (qqa model selection proxy notifier) already patched');
+  }
+
+  // G. $0n: Modal dialog delegation to modalCode.js
+  const s0nTarget = '$0n=({isOpen:e,operation:t,onClose:r,modelName:n,customModelsState:i,pushCustomModelsUpdate:a,setSelectedModelConfig:o})=>{let[s,l]=j(""),';
+  const s0nReplacement = '$0n=({isOpen:e,operation:t,onClose:r,modelName:n,customModelsState:i,pushCustomModelsUpdate:a,setSelectedModelConfig:o})=>{if(!e)return null;try{if(typeof window!=="undefined"&&(window.openAddModelModal||window.__agy_openModal)){let _fn=window.openAddModelModal||window.__agy_openModal;setTimeout(()=>{_fn(window.__agy_default_provider||"openrouter",t==="edit"?n:void 0)},10);r?.();return null}}catch(_e){}let[s,l]=j(""),';
+  if (jsCode.includes(s0nTarget)) {
+    jsCode = jsCode.replace(s0nTarget, s0nReplacement);
+    console.log('   OK - jetskiAgent ($0n modal dialog) delegated to BYOK modal');
+  } else if (jsCode.includes('window.openAddModelModal||window.__agy_openModal')) {
+    console.log('   OK - jetskiAgent ($0n modal dialog) already delegated');
+  }
+
+  // H. Native Quota Service Hook (H7) integration
+  const h7Target = 'function H7(){let e=BU().core.cloudCodeService,t=nt().get("models")?.geminiModelsOnly===!0;return z(()=>{if(!t||!e.retrieveUserQuotaSummary)return e;let r=e.retrieveUserQuotaSummary.bind(e);return{...e,retrieveUserQuotaSummary:async(n,i)=>{let a=await r(n,i);return a.response?{...a,response:{...a.response,groups:[...Czi(a.response.groups,t)??[]]}}:a}}},[e,t])}';
+  const h7Replacement = 'function H7(){let e=BU().core.cloudCodeService,t=nt().get("models")?.geminiModelsOnly===!0;return z(()=>{if(!e)return e;let r=e.retrieveUserQuotaSummary?.bind(e);return{...e,retrieveUserQuotaSummary:async(n,i)=>{let a=r?await r(n,i).catch(()=>({})):{};let bRes=await fetch("http://127.0.0.1:50999/v1internal/quotaSummary").then(x=>x.json()).catch(()=>({groups:[]}));let gGroups=a?.response?.groups||a?.groups||[];let bGroups=bRes?.groups||[];let merged=[...gGroups];for(let bg of bGroups){if(!merged.some(m=>m.displayName===bg.displayName))merged.push(bg)}return a?.response?{...a,response:{...a.response,groups:merged}}:{...a,groups:merged,response:{groups:merged}}}}},[e,t])}';
+  if (jsCode.includes(h7Target)) {
+    jsCode = jsCode.replace(h7Target, h7Replacement);
+    console.log('   OK - jetskiAgent (H7 native quota service hook) patched to merge BYOK quotas');
+  } else if (jsCode.includes('/v1internal/quotaSummary')) {
+    console.log('   OK - jetskiAgent (H7 native quota service hook) already patched');
+  }
+
+  // I. Safe Quota Bucket extraction & description subtext (rOr)
+  const rorTarget = 'function rOr(e){let t=e.remaining.case==="remainingFraction"?e.remaining.value:void 0,r=e.resetTime?rl(e.resetTime):void 0,n=e.description?Vzi(r):void 0;return{remainingFraction:t,refreshText:e.description||"",subtext:n,disabled:e.disabled??!1}}';
+  const rorReplacement = 'function rOr(e){let t=e?.remaining?.case==="remainingFraction"?e.remaining.value:(e?.remainingFraction??e?.remaining?.value),r=e.resetTime?rl(e.resetTime):void 0,n=r?Vzi(r):(e.description||void 0);return{remainingFraction:t,refreshText:e.description||"",subtext:n,disabled:e.disabled??!1}}';
+  if (jsCode.includes(rorTarget)) {
+    jsCode = jsCode.replace(rorTarget, rorReplacement);
+    console.log('   OK - jetskiAgent (rOr safe bucket remainingFraction & description subtext) patched');
+  } else if (jsCode.includes('e?.remaining?.case')) {
+    console.log('   OK - jetskiAgent (rOr) already patched');
+  }
+
+  // J. Inject modalCode.js
+  const modalCodePath = path.join(__dirname, 'modalCode.js');
+  if (fs.existsSync(modalCodePath)) {
+    const modalMarker = '// AGY_ADD_MODEL_MODAL_INJECTED';
+    const modalCode = fs.readFileSync(modalCodePath, 'utf8');
+    if (jsCode.includes(modalMarker)) {
+      const idx = jsCode.indexOf(modalMarker);
+      jsCode = jsCode.substring(0, idx) + modalMarker + '\n' + modalCode + '\n';
+      console.log('   OK - jetskiAgent/main.js modalCode.js updated');
+    } else {
+      jsCode += '\n' + modalMarker + '\n' + modalCode + '\n';
+      console.log('   OK - jetskiAgent/main.js modalCode.js injected');
+    }
+  }
+
+  fs.writeFileSync(jetskiAgentPath, jsCode, 'utf8');
+  console.log('   OK - out/jetskiAgent/main.js written successfully');
+}
+
+// 1d. Patch out/jetskiMain.tailwind.css
+if (fs.existsSync(jetskiCssPath)) {
+  let cssCode = fs.readFileSync(jetskiCssPath, 'utf8');
+  const scrollbarCss = `
+/* Antigravity BYOK Model Menu Scrollbar */
+.custom-scrollbar {
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(140, 140, 140, 0.4) transparent !important;
+}
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px !important;
+  height: 6px !important;
+  display: block !important;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(140, 140, 140, 0.4) !important;
+  border-radius: 4px !important;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(160, 160, 160, 0.7) !important;
+}
+`;
+  if (!cssCode.includes('custom-scrollbar')) {
+    cssCode += scrollbarCss;
+    fs.writeFileSync(jetskiCssPath, cssCode, 'utf8');
+    console.log('   OK - jetskiMain.tailwind.css (custom-scrollbar styles) appended');
+  } else {
+    console.log('   OK - jetskiMain.tailwind.css already contains custom-scrollbar styles');
+  }
+}
+
 // 2. Patch out/main.js
 if (fs.existsSync(mainPath)) {
   let mainCode = fs.readFileSync(mainPath, 'utf8');
@@ -556,7 +728,7 @@ if (fs.existsSync(mainPath)) {
   const rLoTargetRegex = /function\s+rLo\s*\(e\)\s*\{\s*(try\{.*?catch\(_err\)\{\}\s*)?const\s+t\s*=\s*e\.models\s*,\s*n\s*=\s*new\s+Set\s*;/;
   const r2lTargetRegex = /function\s+r2l\s*\(e\)\s*\{\s*(try\{.*?catch\(_err\)\{\}\s*)?const\s+t\s*=\s*e\.models\s*,\s*r\s*=\s*new\s+Set\s*;/;
 
-  const customModelsInjector = `try{const _fs=require("fs"),_path=require("path"),_os=require("os"),_cp=_path.join(_os.homedir(),".gemini","antigravity-ide","custom_models.json");if(_fs.existsSync(_cp)){const _cm=JSON.parse(_fs.readFileSync(_cp,"utf8")),_list=Array.isArray(_cm)?_cm:(_cm.models||[]);for(const _m of _list){if(!_m.name&&!_m.displayName)continue;const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];for(const _l of _lvls){let _raw=(_m.externalModelName||_m.name||"custom-model").replace(/^models\\//,"").replace(/[^a-zA-Z0-9]+/g,"-").replace(/^-+|-+$/g,"").toLowerCase();let _s="custom-"+_raw+(_l?"-"+_l.toLowerCase():"");let _disp=(_m.displayName||_m.name||"custom-model")+(_l?" ("+_l+")":"");let _in=_disp.toLowerCase();let _h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1351+(Math.abs(_h)%290);e.models[_s]={displayName:_disp,model:_ph,supportsImages:!0,recommended:!1,maxTokens:1048576,maxOutputTokens:32768,supportedMimeTypes:{}}}}}}catch(_err){}`;
+  const customModelsInjector = `try{const _fs=globalThis.require?globalThis.require("fs"):(typeof TYa!=="undefined"?TYa:void 0),_path=globalThis.require?globalThis.require("path"):(typeof FA!=="undefined"?FA:void 0),_os=globalThis.require?globalThis.require("os"):(typeof W4o!=="undefined"?W4o:void 0);if(_fs&&_path&&_os){const _cp=_path.join(_os.homedir(),".gemini","antigravity-ide","custom_models.json");if(_fs.existsSync(_cp)){const _cm=JSON.parse(_fs.readFileSync(_cp,"utf8")),_list=Array.isArray(_cm)?_cm:(_cm.models||[]);for(const _m of _list){if(!_m.name&&!_m.displayName)continue;const _lvls=(_m.reasoningEffortLevels&&_m.reasoningEffortLevels.length)?_m.reasoningEffortLevels:[null];for(const _l of _lvls){let _raw=(_m.externalModelName||_m.name||"custom-model").replace(/^models\\//,"").replace(/[^a-zA-Z0-9]+/g,"-").replace(/^-+|-+$/g,"").toLowerCase();let _s="custom-"+_raw+(_l?"-"+_l.toLowerCase():"");let _disp=(_m.displayName||_m.name||"custom-model")+(_l?" ("+_l+")":"");let _in=_disp.toLowerCase();let _h=5381;for(let _k=0;_k<_in.length;_k++)_h=((_h<<5)+_h+_in.charCodeAt(_k))&4294967295;let _ph=1351+(Math.abs(_h)%290);e.models[_s]={displayName:_disp,model:_ph,supportsImages:!0,recommended:!1,maxTokens:1048576,maxOutputTokens:32768,supportedMimeTypes:{}}}}}}}catch(_err){}`;
 
   if (rLoTargetRegex.test(mainCode)) {
     mainCode = mainCode.replace(rLoTargetRegex, `function rLo(e){${customModelsInjector}const t=e.models,n=new Set;`);
