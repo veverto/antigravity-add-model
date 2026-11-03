@@ -101,7 +101,7 @@ export function validateCustomModel(model: unknown): ValidationResult {
 
   const provider = m.provider as string;
   // Validate provider is one of the supported types
-  const validProviders = ['openai', 'anthropic', 'google', 'ollama', 'custom', 'openrouter', 'deepseek', 'groq', 'mistral', 'cerebras', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'nvidia'];
+  const validProviders = ['openai', 'anthropic', 'google', 'ollama', 'custom', 'openrouter', 'deepseek', 'groq', 'mistral', 'cerebras', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'nvidia', 'together'];
   if (!validProviders.includes(provider)) {
     return { valid: false, error: `Unsupported provider: ${provider}. Must be one of: ${validProviders.join(', ')}` };
   }
@@ -144,6 +144,13 @@ export function validateCustomModel(model: unknown): ValidationResult {
         };
       }
     }
+  }
+
+  if (m.maxTokens !== undefined && (typeof m.maxTokens !== 'number' || m.maxTokens <= 0)) {
+    return { valid: false, error: 'maxTokens must be a positive number' };
+  }
+  if (m.maxOutputTokens !== undefined && (typeof m.maxOutputTokens !== 'number' || m.maxOutputTokens <= 0)) {
+    return { valid: false, error: 'maxOutputTokens must be a positive number' };
   }
 
   return { valid: true };

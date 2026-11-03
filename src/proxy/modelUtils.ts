@@ -10,6 +10,8 @@ export interface CustomModelConfig {
   provider: string;
   externalModelName?: string;
   displayName?: string;
+  maxTokens?: number;
+  maxOutputTokens?: number;
 }
 
 export interface ModelCapabilities {
@@ -59,8 +61,16 @@ export function detectModelCapabilities(m: CustomModelConfig, includeDisplayName
 
   const isClaude = m.provider === 'anthropic' || CLAUDE_PATTERN.test(nameLower) || CLAUDE_PATTERN.test(extLower);
 
-  const maxTokens = isClaude ? 200_000 : 1_048_576;
-  const maxOutputTokens = isDeepSeek ? 32_768 : isThinking ? 32_768 : 16_384;
+  const maxTokens = (m.maxTokens && m.maxTokens > 64_000) ? m.maxTokens : (isClaude ? 200_000 : 1_048_576);
+  const maxOutputTokens =
+    m.maxOutputTokens ??
+    (m.maxTokens && m.maxTokens <= 64_000
+      ? m.maxTokens
+      : isDeepSeek
+      ? 32_768
+      : isThinking
+      ? 32_768
+      : 16_384);
 
   // Image support: Claude, GPT-4o, Gemini always support images. DeepSeek, Ollama text models don't.
   const allNames = nameLower + ' ' + extLower + ' ' + displayLower;
@@ -83,4 +93,18 @@ export function detectModelCapabilitiesByName(modelName: string): ModelNameCapab
     isClaudeThinkingModel: CLAUDE_THINKING_PATTERN.test(lower),
     isThinkingModel: THINKING_MODEL_PATTERN.test(lower),
   };
+}
+
+/**
+ * Normaliza URLs para o endpoint de chat completions.
+ */
+export function normalizeChatCompletionsUrl(baseUrl: string): string {
+  if (!baseUrl) return '';
+  const lower = baseUrl.toLowerCase();
+  if (lower.includes('/chat/completions') || lower.includes('/completions') || lower.includes('/messages')) {
+    return baseUrl;
+  }
+  if (baseUrl.endsWith('/v1')) return baseUrl + '/chat/completions';
+  if (!baseUrl.endsWith('/')) return baseUrl + '/v1/chat/completions';
+  return baseUrl + 'v1/chat/completions';
 }

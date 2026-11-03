@@ -267,3 +267,130 @@ describe('Payload Cleanup for Google Requests', () => {
     expect(sanitized.toString('utf-8')).not.toContain('model_id');
   });
 });
+
+describe('OpenRouter Error Classification and Resilience', () => {
+  function classifyOpenRouterError(statusCode: number, errorBody: string): 'in_flight_hold' | 'key_limit' | 'credits_exhausted' | 'generic' {
+    let parsedError: Record<string, unknown> | undefined;
+    try {
+      parsedError = JSON.parse(errorBody);
+    } catch {}
+
+    const errObj = ((parsedError?.error || parsedError) || {}) as Record<string, unknown>;
+    const errMeta = ((errObj?.metadata || parsedError?.metadata) || {}) as Record<string, unknown>;
+    const limitSource = String(errMeta.limit_source || '');
+    const reason = String(errMeta.reason || '');
+    const errMsg = String(errObj.message || '');
+
+    if (
+      limitSource === 'openrouter_in_flight_budget' ||
+      reason === 'in_flight_budget_exhausted' ||
+      errMsg.toLowerCase().includes('in-flight')
+    ) {
+      return 'in_flight_hold';
+    }
+
+    if (limitSource === 'openrouter_key_limit') {
+      return 'key_limit';
+    }
+
+    if (
+      statusCode === 402 ||
+      errObj.code === 402 ||
+      limitSource === 'openrouter_credits'
+    ) {
+      return 'credits_exhausted';
+    }
+
+    return 'generic';
+  }
+
+  it('correctly classifies in_flight_budget_exhausted as in_flight_hold (transient retry)', () => {
+    const errorBody = JSON.stringify({
+      error: {
+        message: 'This request would exceed your available credits given your current in-flight requests.',
+        code: 402,
+        metadata: {
+          reason: 'in_flight_budget_exhausted',
+          limit_source: 'openrouter_in_flight_budget'
+        }
+      }
+    });
+    expect(classifyOpenRouterError(402, errorBody)).toBe('in_flight_hold');
+  });
+
+  it('correctly classifies openrouter_key_limit as key_limit', () => {
+    const errorBody = JSON.stringify({
+      error: {
+        message: 'Key limit reached',
+        code: 402,
+        metadata: {
+          limit_source: 'openrouter_key_limit'
+        }
+      }
+    });
+    expect(classifyOpenRouterError(402, errorBody)).toBe('key_limit');
+  });
+
+  it('correctly classifies openrouter_credits as credits_exhausted', () => {
+    const errorBody = JSON.stringify({
+      error: {
+        message: 'Insufficient credits',
+        code: 402,
+        metadata: {
+          limit_source: 'openrouter_credits'
+        }
+      }
+    });
+    expect(classifyOpenRouterError(402, errorBody)).toBe('credits_exhausted');
+  });
+});
+
+describe('getGoogleDefaultModel', () => {
+  it('returns cachedGoogleDefaultModel if set', async () => {
+    const { getGoogleDefaultModel, setCachedGoogleDefaultModel } = await import('../proxy');
+    setCachedGoogleDefaultModel('gemini-custom-default-test');
+    expect(getGoogleDefaultModel()).toBe('gemini-custom-default-test');
+    setCachedGoogleDefaultModel(undefined);
+  });
+
+  it('reads defaultAgentModelId from fetch_response.json or returns default model when cache is empty', async () => {
+    const { getGoogleDefaultModel, setCachedGoogleDefaultModel } = await import('../proxy');
+    setCachedGoogleDefaultModel(undefined);
+    const model = getGoogleDefaultModel();
+    expect(typeof model).toBe('string');
+    expect(model.length).toBeGreaterThan(0);
+  });
+});
+
+describe('lastActiveCustomModel and isNativeGoogleActive', () => {
+  it('manages lastActiveCustomModel and isNativeGoogleActive state accurately', async () => {
+    const { setLastActiveCustomModel, getLastActiveCustomModel, getIsNativeGoogleActive } = await import('../proxy');
+    
+    // Set a custom model
+    const mockModel = {
+      name: 'models/deepseek-r1',
+      displayName: 'DeepSeek R1',
+      description: 'Test model',
+      provider: 'deepseek',
+      apiKey: 'test-key',
+      apiUrl: 'https://api.deepseek.com',
+      externalModelName: 'deepseek-reasoner',
+    };
+
+    setLastActiveCustomModel(mockModel, false);
+    expect(getLastActiveCustomModel()).toEqual(mockModel);
+    expect(getIsNativeGoogleActive()).toBe(false);
+
+    // Switch to native Google
+    setLastActiveCustomModel(undefined, true);
+    expect(getLastActiveCustomModel()).toBeUndefined();
+    expect(getIsNativeGoogleActive()).toBe(true);
+
+    // Reset
+    setLastActiveCustomModel(undefined, false);
+    expect(getIsNativeGoogleActive()).toBe(false);
+  });
+});
+
+
+

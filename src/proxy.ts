@@ -8,11 +8,28 @@ import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as path from 'path';
-import { app } from 'electron';
+import * as os from 'os';
+
+let app: { getPath: (name: string) => string } = { getPath: () => os.homedir() };
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const electron = require('electron');
+  if (electron?.app) app = electron.app;
+} catch {
+  // Fallback para Node standalone
+}
+
 import log from 'electron-log';
+try {
+  log.transports.file.setAppName('antigravity-ide');
+} catch (_) {
+  // Ignora se transporte de arquivo não estiver ativo
+}
 import { getAutoSwitchConfigPath, loadAutoSwitchPolicy } from './autoSwitch/config';
 import { hasProtectedText, resolveFallbackRoutes, resolveRoute } from './autoSwitch/router';
 import type { AutoSwitchRoute, RequestFeatures, RouteDecision } from './autoSwitch/types';
+import { fetchProviderQuota, fetchProviderModelsList } from './proxy/adapters';
+import { resolveModelSpec } from './proxy/modelSpecs';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -31,6 +48,18 @@ export interface CustomModel {
   maxRetries?: number;
   reasoningEffortLevels?: string[];
   effort?: string;
+  maxTokens?: number;
+  maxOutputTokens?: number;
+}
+
+export interface ProviderConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  encrypted?: boolean;
+}
+
+export interface ProvidersMap {
+  [providerName: string]: ProviderConfig;
 }
 
 interface GeminiRequestBody {
@@ -73,9 +102,8 @@ import { detectModelCapabilities, detectModelCapabilitiesByName } from './proxy/
 // Provider translator registry (auto-discovers translators from proxy/translators/)
 import * as registry from './proxy/registry';
 
-// Dynamic imports (stays require for Electron-specific modules)
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const cryptoStore = require('./cryptoStore');
+// Dynamic imports
+import * as cryptoStore from './cryptoStore';
 
 // ─── Model Helpers ────────────────────────────────────────────────────────
 
@@ -95,6 +123,54 @@ function getCustomModelsPath(): string {
   const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
   return path.join(geminiDir, 'custom_models.json');
 }
+
+let cachedGoogleDefaultModel: string | undefined;
+let lastActiveCustomModel: CustomModel | undefined;
+let isNativeGoogleActive = false;
+
+export function setCachedGoogleDefaultModel(modelId: string | undefined): void {
+  cachedGoogleDefaultModel = modelId;
+}
+
+export function setLastActiveCustomModel(model: CustomModel | undefined, isNative = false): void {
+  lastActiveCustomModel = model;
+  isNativeGoogleActive = isNative;
+}
+
+export function getLastActiveCustomModel(): CustomModel | undefined {
+  return lastActiveCustomModel;
+}
+
+export function getIsNativeGoogleActive(): boolean {
+  return isNativeGoogleActive;
+}
+
+export function getGoogleDefaultModel(): string {
+  if (cachedGoogleDefaultModel) {
+    return cachedGoogleDefaultModel;
+  }
+  try {
+    const fetchPath = path.join(app.getPath('home'), '.gemini', 'antigravity-ide', 'fetch_response.json');
+    if (fs.existsSync(fetchPath)) {
+      const data = JSON.parse(fs.readFileSync(fetchPath, 'utf8'));
+      if (typeof data.defaultAgentModelId === 'string' && data.defaultAgentModelId) {
+        cachedGoogleDefaultModel = data.defaultAgentModelId;
+        return cachedGoogleDefaultModel;
+      }
+      if (Array.isArray(data.agentModelSorts) && data.agentModelSorts.length > 0) {
+        const groups = data.agentModelSorts[0]?.groups;
+        if (Array.isArray(groups) && groups.length > 0 && Array.isArray(groups[0]?.modelIds) && groups[0].modelIds.length > 0) {
+          cachedGoogleDefaultModel = groups[0].modelIds[0];
+          return cachedGoogleDefaultModel;
+        }
+      }
+    }
+  } catch (e) {
+    log.error('[Proxy] Failed to load Google default model from fetch_response.json:', e);
+  }
+  return 'gemini-2.5-pro';
+}
+
 
 function toSlug(model: CustomModel): string {
   return (
@@ -171,20 +247,35 @@ function findCustomModelForRoute(target: AutoSwitchRoute, models: CustomModel[])
 
 function isModelMatch(m: CustomModel, targetModel: string | undefined, targetId?: string | undefined): boolean {
   if (!targetModel && !targetId) return false;
-  const cleanTarget = targetModel ? targetModel.replace(/^models\//, '').toLowerCase() : '';
-  const cleanTargetId = targetId ? targetId.replace(/^models\//, '').toLowerCase() : '';
+  const cleanTarget = targetModel
+    ? targetModel.replace(/^gemini-api:\/models\//, '').replace(/^gemini-api:\//, '').replace(/^models\//, '').toLowerCase()
+    : '';
+  const cleanTargetId = targetId
+    ? targetId.replace(/^gemini-api:\/models\//, '').replace(/^gemini-api:\//, '').replace(/^models\//, '').toLowerCase()
+    : '';
 
   const cleanName = m.name.replace(/^models\//, '').toLowerCase();
   const slug = toSlug(m).toLowerCase();
   const enumName = generateModelPlaceholderId(m).toLowerCase();
   const enumInt = parseInt(generateModelPlaceholderId(m).split('_M')[1], 10).toString();
+  const extName = (m.externalModelName || '').replace(/^models\//, '').toLowerCase();
+  const dispName = (m.displayName || '').toLowerCase();
 
   return (
     cleanName === cleanTarget ||
     slug === cleanTarget ||
     enumName === cleanTarget ||
     enumInt === cleanTarget ||
-    (cleanTargetId !== '' && (cleanName === cleanTargetId || slug === cleanTargetId || enumName === cleanTargetId || enumInt === cleanTargetId))
+    (extName !== '' && (extName === cleanTarget || cleanTarget.includes(extName))) ||
+    (dispName !== '' && dispName === cleanTarget) ||
+    (cleanTargetId !== '' && (
+      cleanName === cleanTargetId ||
+      slug === cleanTargetId ||
+      enumName === cleanTargetId ||
+      enumInt === cleanTargetId ||
+      (extName !== '' && (extName === cleanTargetId || cleanTargetId.includes(extName))) ||
+      (dispName !== '' && dispName === cleanTargetId)
+    ))
   );
 }
 
@@ -195,9 +286,25 @@ function matchCustomModelWithEffort(
 ): CustomModel | undefined {
   if (!targetModel && !targetId) return undefined;
 
+  let extractedEffort: string | undefined;
+  let baseTargetModel = targetModel;
+  if (targetModel) {
+    const effortMatch = targetModel.match(/\((default|low|medium|high)\)$/i);
+    if (effortMatch) {
+      extractedEffort = effortMatch[1].toLowerCase();
+      baseTargetModel = targetModel.replace(/\s*\((default|low|medium|high)\)$/i, '').trim();
+    }
+  }
+
   for (const m of models) {
-    if (isModelMatch(m, targetModel, targetId)) {
-      return { ...m };
+    if (
+      isModelMatch(m, targetModel, targetId) ||
+      (baseTargetModel && isModelMatch(m, baseTargetModel, targetId))
+    ) {
+      return {
+        ...m,
+        effort: extractedEffort || m.effort,
+      };
     }
 
     // Check effort variants (e.g. custom-kimi-k3-high, custom-kimi-k3-default, etc.)
@@ -270,6 +377,145 @@ function resolveAutoSwitchModel(
 }
 
 
+function loadProviders(): ProvidersMap {
+  const filePath = getCustomModelsPath();
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as { providers?: ProvidersMap };
+    const rawProviders = parsed.providers || {};
+    const decryptedProviders: ProvidersMap = {};
+    for (const [name, cfg] of Object.entries(rawProviders)) {
+      decryptedProviders[name.toLowerCase()] = {
+        ...cfg,
+        apiKey: cfg.apiKey ? cryptoStore.decryptString(cfg.apiKey) : undefined,
+      };
+    }
+    return decryptedProviders;
+  } catch (err) {
+    log.error('[Proxy] Failed to load providers:', err);
+    return {};
+  }
+}
+
+function findCustomModelInfoOverride(obj: unknown, depth = 0): Record<string, unknown> | undefined {
+  if (!obj || typeof obj !== 'object' || depth > 5) return undefined;
+  const record = obj as Record<string, unknown>;
+  const override = record.customModelInfoOverride || record.custom_model_info_override;
+  if (override && typeof override === 'object') {
+    return override as Record<string, unknown>;
+  }
+  for (const key of Object.keys(record)) {
+    const val = record[key];
+    if (val && typeof val === 'object') {
+      const found = findCustomModelInfoOverride(val, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function resolveTargetCustomModel(
+  reqJson: Record<string, unknown>,
+  customModels: CustomModel[],
+  providers: ProvidersMap,
+): CustomModel | undefined {
+  const actualReq = (reqJson.request || reqJson) as Record<string, unknown>;
+  const override =
+    findCustomModelInfoOverride(reqJson) ||
+    findCustomModelInfoOverride(actualReq) ||
+    (reqJson.customModelInfoOverride as Record<string, unknown> | undefined) ||
+    (reqJson.custom_model_info_override as Record<string, unknown> | undefined) ||
+    (actualReq.customModelInfoOverride as Record<string, unknown> | undefined) ||
+    (actualReq.custom_model_info_override as Record<string, unknown> | undefined) ||
+    ((reqJson.plannerConfig as Record<string, unknown> | undefined)?.customModelInfoOverride as Record<string, unknown> | undefined) ||
+    ((reqJson.planner_config as Record<string, unknown> | undefined)?.custom_model_info_override as Record<string, unknown> | undefined) ||
+    ((actualReq.plannerConfig as Record<string, unknown> | undefined)?.customModelInfoOverride as Record<string, unknown> | undefined) ||
+    ((actualReq.planner_config as Record<string, unknown> | undefined)?.custom_model_info_override as Record<string, unknown> | undefined);
+
+  const candidateNames = [
+    override?.modelName,
+    override?.model_name,
+    override?.chatModelName,
+    override?.chat_model_name,
+    override?.customModelUrl,
+    override?.custom_model_url,
+    reqJson.model,
+    actualReq.model,
+    reqJson.modelId,
+    reqJson.model_id,
+    actualReq.modelId,
+    actualReq.model_id,
+    (reqJson.requestedModel as Record<string, unknown> | undefined)?.model,
+    (reqJson.requested_model as Record<string, unknown> | undefined)?.model,
+    (actualReq.requestedModel as Record<string, unknown> | undefined)?.model,
+    (actualReq.requested_model as Record<string, unknown> | undefined)?.model,
+  ].filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+
+  const effortValue = (override?.effort || override?.reasoningEffort || override?.reasoning_effort) as string | undefined;
+
+  // 1. Try matching with customModels list
+  for (const name of candidateNames) {
+    const matched = matchCustomModelWithEffort(customModels, name);
+    if (matched) {
+      if (effortValue && !matched.effort) {
+        matched.effort = String(effortValue).toLowerCase();
+      }
+      if ((!matched.apiKey || matched.apiKey === 'none') && matched.provider && providers[matched.provider.toLowerCase()]) {
+        const prov = providers[matched.provider.toLowerCase()];
+        matched.apiKey = prov.apiKey || '';
+        if (!matched.apiUrl && prov.apiUrl) matched.apiUrl = prov.apiUrl;
+      }
+      return matched;
+    }
+  }
+
+  // 2. Check if candidate name specifies a provider directly (e.g. "openrouter/meta-llama/llama-3.3-70b-instruct" or "deepseek/deepseek-chat")
+  for (const name of candidateNames) {
+    const cleanName = name.replace(/^models\//, '').trim();
+    const slashIdx = cleanName.indexOf('/');
+    if (slashIdx !== -1) {
+      const potentialProvider = cleanName.substring(0, slashIdx).toLowerCase();
+      const targetModel = cleanName.substring(slashIdx + 1);
+      if (providers[potentialProvider]) {
+        const prov = providers[potentialProvider];
+        const dispName = ((override?.chatModelName || override?.chat_model_name) as string) || cleanName;
+        return {
+          name: `models/${cleanName.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+          displayName: dispName,
+          description: `Custom model via ${potentialProvider}`,
+          provider: potentialProvider,
+          apiKey: prov.apiKey || '',
+          apiUrl: prov.apiUrl || '',
+          externalModelName: targetModel,
+          maxOutputTokens: 8192,
+          effort: effortValue ? String(effortValue).toLowerCase() : undefined,
+        };
+      }
+    }
+
+    // Default to OpenRouter if openrouter is configured and model has an author/model slash (e.g. "google/gemini-3.8-flash")
+    if (providers['openrouter'] && cleanName.includes('/')) {
+      const prov = providers['openrouter'];
+      const dispName = ((override?.chatModelName || override?.chat_model_name) as string) || cleanName;
+      return {
+        name: `models/${cleanName.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+        displayName: dispName,
+        description: `Custom model via openrouter`,
+        provider: 'openrouter',
+        apiKey: prov.apiKey || '',
+        apiUrl: prov.apiUrl || 'https://openrouter.ai/api/v1/chat/completions',
+        externalModelName: cleanName,
+        maxOutputTokens: 8192,
+        effort: effortValue ? String(effortValue).toLowerCase() : undefined,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+
 // ─── Model Loading ────────────────────────────────────────────────────────
 
 function loadCustomModels(): CustomModel[] {
@@ -303,6 +549,7 @@ function loadCustomModels(): CustomModel[] {
           displayName: 'Llama 3 (Local Ollama)',
           description: 'Local Ollama Llama 3 model run on your machine',
           provider: 'ollama',
+          apiKey: '',
           apiUrl: 'http://localhost:11434/v1/chat/completions',
           externalModelName: 'llama3',
         },
@@ -323,7 +570,7 @@ function loadCustomModels(): CustomModel[] {
 
   try {
     const content = fs.readFileSync(filePath, 'utf-8');
-    const parsed = JSON.parse(content) as { models?: CustomModel[] };
+    const parsed = JSON.parse(content) as { models?: CustomModel[]; providers?: ProvidersMap };
     const models = parsed.models || [];
 
     // Auto-migration check
@@ -340,7 +587,11 @@ function loadCustomModels(): CustomModel[] {
       cryptoStore.backupFile(filePath);
       const encryptedModels = cryptoStore.encryptModels(models);
       try {
-        fs.writeFileSync(filePath, JSON.stringify({ models: encryptedModels }, null, 2), 'utf-8');
+        fs.writeFileSync(
+          filePath,
+          JSON.stringify({ providers: parsed.providers, models: encryptedModels }, null, 2),
+          'utf-8',
+        );
         log.info('[Proxy] Successfully migrated custom_models.json to encrypted format.');
         return cryptoStore.decryptModels(encryptedModels);
       } catch (err) {
@@ -349,13 +600,24 @@ function loadCustomModels(): CustomModel[] {
     }
 
     const decrypted = cryptoStore.decryptModels(models) as CustomModel[];
+    const providers = loadProviders();
 
-    // Validate all models
+    // Validate all models and inherit provider master keys if omitted
     const validModels: CustomModel[] = [];
     for (let i = 0; i < decrypted.length; i++) {
-      const validation = validateCustomModel(decrypted[i]) as { valid: boolean; error?: string };
+      const m = decrypted[i];
+      if (
+        (!m.apiKey || m.apiKey === 'none' || m.apiKey.startsWith('DECRYPTION_FAILED') || m.apiKey.startsWith('enc:')) &&
+        m.provider &&
+        providers[m.provider.toLowerCase()]
+      ) {
+        const prov = providers[m.provider.toLowerCase()];
+        m.apiKey = prov.apiKey || '';
+        if (!m.apiUrl && prov.apiUrl) m.apiUrl = prov.apiUrl;
+      }
+      const validation = validateCustomModel(m) as { valid: boolean; error?: string };
       if (validation.valid) {
-        validModels.push(decrypted[i]);
+        validModels.push(m);
       } else {
         log.warn(`[Proxy] Skipping invalid model at index ${i}: ${validation.error}`);
       }
@@ -594,6 +856,45 @@ function parseRetryAfter(headers: Record<string, string | string[] | undefined>)
   return 0;
 }
 
+/**
+ * Synthesizes a clean assistant response in either SSE or JSON format
+ * to prevent IDE agent crashes when upstream returns non-retryable errors.
+ */
+function sendSyntheticNotice(
+  res: http.ServerResponse,
+  isStream: boolean,
+  noticeText: string,
+): void {
+  if (res.headersSent) return;
+  const notice = {
+    response: {
+      candidates: [
+        {
+          content: {
+            parts: [{ text: noticeText }],
+            role: 'model',
+          },
+          finishReason: 'STOP',
+          index: 0,
+        },
+      ],
+    },
+  };
+  if (isStream) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(`data: ${JSON.stringify(notice)}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } else {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(notice));
+  }
+}
+
 function handleCustomModelRequest(
   res: http.ServerResponse,
   model: CustomModel,
@@ -625,8 +926,28 @@ function handleCustomModelRequest(
 
   const provider = model.provider === 'custom' || model.provider === 'openrouter' ? 'openai' : model.provider;
 
-  const payload = registry.translateRequest(provider, geminiBody, model.externalModelName, model.effort);
-  const headers = registry.getProviderHeaders(provider, model.apiKey);
+  // Use configured maxOutputTokens if provided, or safe fallback for OpenRouter
+  const configuredMaxTokens = model.maxOutputTokens || (model.maxTokens && model.maxTokens <= 64_000 ? model.maxTokens : undefined);
+  if (!geminiBody.generationConfig) {
+    geminiBody.generationConfig = {};
+  }
+  // Only initialize on initial try (retryCount === 0) so dynamic step-downs during retries are preserved
+  if (retryCount === 0) {
+    if (model.provider === 'openrouter') {
+      // OpenRouter calculates upfront credit reservation based on max_tokens.
+      // Clamp to 8192 to prevent HTTP 402 ("credit limit exceeded") errors.
+      geminiBody.generationConfig.maxOutputTokens = configuredMaxTokens && configuredMaxTokens <= 8192 ? configuredMaxTokens : 8192;
+    } else if (configuredMaxTokens) {
+      geminiBody.generationConfig.maxOutputTokens = configuredMaxTokens;
+    }
+  }
+
+  const payload = registry.translateRequest(provider, geminiBody, model.externalModelName, model.effort, {
+    maxTokens: model.maxTokens,
+    maxOutputTokens: model.maxOutputTokens,
+    workingContextBudget: (model as any).workingContextBudget,
+  });
+  const headers = registry.getProviderHeaders(model.provider, model.apiKey);
 
   if (isStream && registry.supportsStreaming(provider)) {
     (payload as Record<string, unknown>).stream = true;
@@ -638,7 +959,7 @@ function handleCustomModelRequest(
   if (provider === 'google' || provider === 'ollama') {
     const providerTranslator = registry.getTranslator(provider);
     finalUrlStr = registry.getProviderUrl(finalUrlStr, model.externalModelName, isStream, providerTranslator);
-  } else if (provider === 'openai' || model.provider === 'custom' || model.provider === 'openrouter') {
+  } else if (provider !== 'anthropic' && provider !== 'google') {
     finalUrlStr = registry.normalizeChatCompletionsUrl(finalUrlStr);
   }
   const url = new URL(finalUrlStr);
@@ -681,7 +1002,98 @@ function handleCustomModelRequest(
         apiRes.on('data', (chunk: Buffer) => errorBody += chunk.toString());
         apiRes.on('end', () => {
           log.error(`[Proxy] Stream API error (${apiRes.statusCode}) for ${model.name}: ${errorBody.substring(0, 300)}`);
-          if (retryCount < MAX_RETRIES) {
+
+          let parsedError: Record<string, unknown> | undefined;
+          try {
+            parsedError = JSON.parse(errorBody);
+          } catch {}
+
+          const errObj = ((parsedError?.error || parsedError) || {}) as Record<string, unknown>;
+          const errMeta = ((errObj?.metadata || parsedError?.metadata) || {}) as Record<string, unknown>;
+          const limitSource = String(errMeta.limit_source || '');
+          const reason = String(errMeta.reason || '');
+          const errMsg = String(errObj.message || '');
+
+          const isInFlightHold =
+            limitSource === 'openrouter_in_flight_budget' ||
+            reason === 'in_flight_budget_exhausted' ||
+            errMsg.toLowerCase().includes('in-flight');
+
+          const isKeyLimit = limitSource === 'openrouter_key_limit';
+
+          const isCreditExhaustion =
+            apiRes.statusCode === 402 ||
+            errObj.code === 402 ||
+            limitSource === 'openrouter_credits';
+
+          // 1. Transient in-flight budget hold (concurrency hold on previous/active requests)
+          if (isInFlightHold) {
+            const retryAfter = parseRetryAfter(apiRes.headers);
+            const rawDelay = retryAfter > 0 ? retryAfter : Math.max(2000, 1500 * Math.pow(1.5, retryCount));
+            const delay = Math.min(rawDelay, 8000);
+            const currentTokens = geminiBody.generationConfig?.maxOutputTokens || 2048;
+            const nextTokens = Math.max(512, Math.floor(currentTokens / 2));
+            if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
+            geminiBody.generationConfig.maxOutputTokens = nextTokens;
+
+            if (retryCount < MAX_RETRIES) {
+              log.info(
+                `[Proxy] In-flight hold (${reason || limitSource}) for ${model.name}. Stepping down maxOutputTokens to ${nextTokens} and waiting ${delay}ms before retry (${retryCount + 1}/${MAX_RETRIES})...`,
+              );
+              setTimeout(
+                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+                delay,
+              );
+              return;
+            }
+
+            if (handOverToFallback('In-flight budget hold')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⏳ **Aviso de Concorrência (${model.displayName || model.name})**: As requisições anteriores ainda estão em processamento ou retenção temporária no provedor (${reason || 'in_flight_budget'}).\n\nPor favor, aguarde alguns segundos e envie sua mensagem novamente.`,
+            );
+            return;
+          }
+
+          // 2. Specific key spending limit reached (configured in provider dashboard)
+          if (isKeyLimit) {
+            if (handOverToFallback('Key limit reached')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⚠️ **Aviso de Limite da Chave (${model.displayName || model.name})**: O limite configurado para esta chave de API foi atingido.\n\nVerifique as configurações da sua chave em openrouter.ai/keys (ajuste o limite para "Unlimited" se desejar usar o saldo da carteira) ou selecione outro modelo para continuar.`,
+            );
+            return;
+          }
+
+          // 3. Genuine credit exhaustion on provider account
+          if (isCreditExhaustion) {
+            const currentTokens = geminiBody.generationConfig?.maxOutputTokens || 2048;
+            const nextTokens = Math.floor(currentTokens / 2);
+            if (nextTokens >= 512 && retryCount < MAX_RETRIES) {
+              log.info(
+                `[Proxy] Credit exhaustion (402) detected for ${model.name}. Stepping down maxOutputTokens from ${currentTokens} to ${nextTokens} and retrying...`,
+              );
+              if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
+              geminiBody.generationConfig.maxOutputTokens = nextTokens;
+              setTimeout(
+                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+                1000,
+              );
+              return;
+            }
+
+            if (handOverToFallback('Credits exhausted')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⚠️ **Aviso de Saldo (${model.displayName || model.name})**: Os créditos no provedor atingiram o limite para o tamanho desta conversa.\n\nPor favor, recarregue seus créditos no painel do provedor ou selecione outro modelo no seletor para continuar.`,
+            );
+            return;
+          }
+
+          if (retryCount < MAX_RETRIES && apiRes.statusCode !== 401 && apiRes.statusCode !== 403 && apiRes.statusCode !== 404) {
             log.warn(`[Proxy] Stream error, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
             setTimeout(
               () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
@@ -799,8 +1211,92 @@ function handleCustomModelRequest(
         }
 
         if (apiRes.statusCode! >= 400) {
-          // P0-3: Only log status code and model name, NOT response body content
           log.error(`[Proxy] API error (${apiRes.statusCode}) for ${model.name}`);
+
+          let parsedError: Record<string, unknown> | undefined;
+          try {
+            parsedError = JSON.parse(body);
+          } catch {}
+
+          const errObj = ((parsedError?.error || parsedError) || {}) as Record<string, unknown>;
+          const errMeta = ((errObj?.metadata || parsedError?.metadata) || {}) as Record<string, unknown>;
+          const limitSource = String(errMeta.limit_source || '');
+          const reason = String(errMeta.reason || '');
+          const errMsg = String(errObj.message || '');
+
+          const isInFlightHold =
+            limitSource === 'openrouter_in_flight_budget' ||
+            reason === 'in_flight_budget_exhausted' ||
+            errMsg.toLowerCase().includes('in-flight');
+
+          const isKeyLimit = limitSource === 'openrouter_key_limit';
+
+          const isCreditExhaustion =
+            apiRes.statusCode === 402 ||
+            errObj.code === 402 ||
+            limitSource === 'openrouter_credits';
+
+          // 1. Transient in-flight budget hold (concurrency hold on previous/active requests)
+          if (isInFlightHold) {
+            const retryAfter = parseRetryAfter(apiRes.headers);
+            const rawDelay = retryAfter > 0 ? retryAfter : Math.max(2000, 1500 * Math.pow(1.5, retryCount));
+            const delay = Math.min(rawDelay, 8000);
+            const currentTokens = geminiBody.generationConfig?.maxOutputTokens || 2048;
+            const nextTokens = Math.max(512, Math.floor(currentTokens / 2));
+            if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
+            geminiBody.generationConfig.maxOutputTokens = nextTokens;
+
+            if (retryCount < MAX_RETRIES) {
+              log.info(
+                `[Proxy] In-flight hold (${reason || limitSource}) for ${model.name}. Stepping down maxOutputTokens to ${nextTokens} and waiting ${delay}ms before retry (${retryCount + 1}/${MAX_RETRIES})...`,
+              );
+              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), delay);
+              return;
+            }
+
+            if (handOverToFallback('In-flight budget hold')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⏳ **Aviso de Concorrência (${model.displayName || model.name})**: As requisições anteriores ainda estão em processamento ou retenção temporária no provedor (${reason || 'in_flight_budget'}).\n\nPor favor, aguarde alguns segundos e envie sua mensagem novamente.`,
+            );
+            return;
+          }
+
+          // 2. Specific key spending limit reached (configured in provider dashboard)
+          if (isKeyLimit) {
+            if (handOverToFallback('Key limit reached')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⚠️ **Aviso de Limite da Chave (${model.displayName || model.name})**: O limite configurado para esta chave de API foi atingido.\n\nVerifique as configurações da sua chave em openrouter.ai/keys (ajuste o limite para "Unlimited" se desejar usar o saldo da carteira) ou selecione outro modelo para continuar.`,
+            );
+            return;
+          }
+
+          // 3. Genuine credit exhaustion on provider account
+          if (isCreditExhaustion) {
+            const currentTokens = geminiBody.generationConfig?.maxOutputTokens || 2048;
+            const nextTokens = Math.floor(currentTokens / 2);
+            if (nextTokens >= 512 && retryCount < MAX_RETRIES) {
+              log.info(
+                `[Proxy] Credit exhaustion (402) detected for ${model.name}. Stepping down maxOutputTokens from ${currentTokens} to ${nextTokens} and retrying...`,
+              );
+              if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
+              geminiBody.generationConfig.maxOutputTokens = nextTokens;
+              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), 1000);
+              return;
+            }
+
+            if (handOverToFallback('Credits exhausted')) return;
+            sendSyntheticNotice(
+              res,
+              isStream,
+              `⚠️ **Aviso de Saldo (${model.displayName || model.name})**: Os créditos no provedor atingiram o limite para o tamanho desta conversa.\n\nPor favor, recarregue seus créditos no painel do provedor ou selecione outro modelo no seletor para continuar.`,
+            );
+            return;
+          }
+
           if (handOverToFallback(`HTTP ${apiRes.statusCode}`)) return;
           res.writeHead(apiRes.statusCode!, { 'Content-Type': 'application/json' });
           res.end(body);
@@ -1162,12 +1658,298 @@ function handleGetAvailableModelsProxy(
   lsReq.end();
 }
 
+// ─── Google Quota Cache & Proactive Fetcher ──────────────────────────────────
+let cachedGoogleQuotaGroups: unknown[] = [];
+let lastGoogleAuthHeader: string | undefined = undefined;
+const GOOGLE_QUOTA_CACHE_FILE = path.join(os.homedir(), '.gemini', 'antigravity-ide', 'google_quota_cache.json');
+
+function normalizeQuotaGroups(groups: unknown[]): unknown[] {
+  if (!Array.isArray(groups)) return [];
+  for (const g of groups) {
+    if (g && typeof g === 'object' && Array.isArray((g as Record<string, unknown>).buckets)) {
+      for (const b of (g as Record<string, unknown>).buckets as Record<string, unknown>[]) {
+        if (b && typeof b === 'object') {
+          const rem = b.remaining as Record<string, unknown> | undefined;
+          const remFrac = typeof b.remainingFraction === 'number' ? b.remainingFraction : undefined;
+          if ((!rem || rem.case !== 'remainingFraction') && remFrac !== undefined) {
+            b.remaining = {
+              case: 'remainingFraction',
+              value: remFrac,
+            };
+          }
+          if (rem && typeof rem.value === 'number' && b.remainingFraction === undefined) {
+            b.remainingFraction = rem.value;
+          }
+        }
+      }
+    }
+  }
+  return groups;
+}
+
+function loadCachedGoogleQuotaGroups(): unknown[] {
+  if (cachedGoogleQuotaGroups.length > 0) {
+    return normalizeQuotaGroups(cachedGoogleQuotaGroups);
+  }
+  try {
+    if (fs.existsSync(GOOGLE_QUOTA_CACHE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(GOOGLE_QUOTA_CACHE_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length > 0) {
+        cachedGoogleQuotaGroups = normalizeQuotaGroups(data);
+        return cachedGoogleQuotaGroups;
+      }
+    }
+  } catch (err) {
+    log.warn('[Proxy] Failed to load cached google quota:', (err as Error).message);
+  }
+  return [];
+}
+
+function saveCachedGoogleQuotaGroups(groups: unknown[]): void {
+  try {
+    normalizeQuotaGroups(groups);
+    cachedGoogleQuotaGroups = groups;
+    const dir = path.dirname(GOOGLE_QUOTA_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(GOOGLE_QUOTA_CACHE_FILE, JSON.stringify(groups, null, 2), 'utf8');
+  } catch (err) {
+    log.warn('[Proxy] Failed to save cached google quota:', (err as Error).message);
+  }
+}
+
+async function fetchGoogleQuotaSummaryProactively(): Promise<unknown[]> {
+  if (!lastGoogleAuthHeader) {
+    return loadCachedGoogleQuotaGroups();
+  }
+  return new Promise((resolve) => {
+    try {
+      const parsedUrl = new URL('/v1internal:retrieveUserQuotaSummary', 'https://cloudcode-pa.googleapis.com');
+      const reqOpts: https.RequestOptions = {
+        method: 'POST',
+        headers: {
+          Host: 'cloudcode-pa.googleapis.com',
+          Authorization: lastGoogleAuthHeader,
+          'Content-Type': 'application/json',
+          'User-Agent': 'antigravity',
+        },
+      };
+      const gReq = https.request(parsedUrl, reqOpts, (gRes) => {
+        const chunks: Buffer[] = [];
+        gRes.on('data', (c: Buffer) => chunks.push(c));
+        gRes.on('end', () => {
+          try {
+            const buf = Buffer.concat(chunks);
+            let str = buf.toString('utf8');
+            if (buf.length > 5 && buf[0] === 0) {
+              const candidate = buf.subarray(5).toString('utf8');
+              if (candidate.trim().startsWith('{')) str = candidate;
+            }
+            if (str.trim().startsWith('{')) {
+              const parsed = JSON.parse(str) as Record<string, unknown>;
+              const targetObj = parsed.response && typeof parsed.response === 'object' ? (parsed.response as Record<string, unknown>) : parsed;
+              if (targetObj && Array.isArray(targetObj.groups)) {
+                const pure = (targetObj.groups as Record<string, unknown>[]).filter(
+                  (g) => g && typeof g.displayName === 'string' && !g.displayName.includes('(BYOK)'),
+                );
+                if (pure.length > 0) {
+                  saveCachedGoogleQuotaGroups(pure);
+                  log.info(`[Proxy] Proactively fetched and cached ${pure.length} Google native quota groups`);
+                  return resolve(pure);
+                }
+              }
+            }
+          } catch (err) {
+            log.warn('[Proxy] Failed parsing proactive google quota response:', (err as Error).message);
+          }
+          resolve(loadCachedGoogleQuotaGroups());
+        });
+      });
+      gReq.on('error', (err) => {
+        log.warn('[Proxy] Proactive google quota request error:', err.message);
+        resolve(loadCachedGoogleQuotaGroups());
+      });
+      gReq.setTimeout(4000, () => {
+        gReq.destroy();
+        resolve(loadCachedGoogleQuotaGroups());
+      });
+      gReq.write('{}');
+      gReq.end();
+    } catch {
+      resolve(loadCachedGoogleQuotaGroups());
+    }
+  });
+}
+
+// ─── retrieveUserQuotaSummary Proxy Handler ──────────────────────────────────
+
+function handleRetrieveUserQuotaSummaryProxy(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  reqBody: Buffer,
+): void {
+  if (req.headers['authorization'] && typeof req.headers['authorization'] === 'string' && req.headers['authorization'].startsWith('Bearer ')) {
+    lastGoogleAuthHeader = req.headers['authorization'];
+  }
+  const isDaily = req.url!.includes('xxxxxxx') || req.url!.includes('daily');
+  const targetHost = isDaily ? 'daily-cloudcode-pa.googleapis.com' : 'cloudcode-pa.googleapis.com';
+  const targetUrl = `https://${targetHost}`;
+
+  let reqPath = req.url!;
+  reqPath = reqPath.replace(/^\/v1internal\/(xxxxxxx|x)\/?/, '/');
+  if (!reqPath.startsWith('/')) reqPath = '/' + reqPath;
+  const parsedUrl = new URL(reqPath, targetUrl);
+
+  const fwdHeaders: Record<string, string | string[] | undefined> = {
+    ...(req.headers as Record<string, string | string[] | undefined>),
+  };
+  fwdHeaders['host'] = targetHost;
+  delete fwdHeaders['connection'];
+  delete fwdHeaders['keep-alive'];
+  delete fwdHeaders['accept-encoding'];
+
+  const fwdOptions: https.RequestOptions = {
+    method: req.method,
+    headers: fwdHeaders as Record<string, string>,
+  };
+
+  const googleReq = https.request(parsedUrl, fwdOptions, (googleRes) => {
+    const chunks: Buffer[] = [];
+    googleRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+    googleRes.on('end', async () => {
+      let finalBuf = Buffer.concat(chunks);
+      log.info(`[Proxy] retrieveUserQuotaSummary response from Google (status: ${googleRes.statusCode}, bytes: ${finalBuf.length})`);
+
+      try {
+        let jsonStr = '';
+        let hasGrpcHeader = false;
+
+        if (finalBuf.length > 5 && finalBuf[0] === 0) {
+          const candidate = finalBuf.subarray(5).toString('utf8');
+          if (candidate.trim().startsWith('{')) {
+            jsonStr = candidate;
+            hasGrpcHeader = true;
+          }
+        }
+        if (!jsonStr) {
+          const direct = finalBuf.toString('utf8');
+          if (direct.trim().startsWith('{')) {
+            jsonStr = direct;
+          }
+        }
+
+        if (jsonStr) {
+          const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+          const targetObj = parsed.response && typeof parsed.response === 'object'
+            ? (parsed.response as Record<string, unknown>)
+            : parsed;
+
+          if (targetObj && Array.isArray(targetObj.groups)) {
+            const pureGoogle = (targetObj.groups as Record<string, unknown>[]).filter(
+              (g) => g && typeof g.displayName === 'string' && !g.displayName.includes('(BYOK)'),
+            );
+            if (pureGoogle.length > 0) {
+              saveCachedGoogleQuotaGroups(pureGoogle);
+              log.info(`[Proxy] Cached ${pureGoogle.length} Google native quota groups`);
+            }
+
+            const customModels = loadCustomModels();
+            const providersSeen = new Set<string>();
+
+            for (const cm of customModels) {
+              const prov = (cm.provider || '').toLowerCase().trim();
+              if (!prov || providersSeen.has(prov)) continue;
+              providersSeen.add(prov);
+
+              try {
+                const quota = await fetchProviderQuota(prov, cm.apiKey, cm.apiUrl);
+                if (quota) {
+                  const customBucket = {
+                    displayName: 'Saldo Disponível',
+                    description: quota.refreshText || (quota.balanceUsd !== undefined ? `$${quota.balanceUsd.toFixed(2)} restantes` : 'Ativo'),
+                    remaining: {
+                      case: 'remainingFraction',
+                      value: quota.remainingFraction ?? 1.0,
+                    },
+                    remainingFraction: quota.remainingFraction ?? 1.0,
+                  };
+
+                  (targetObj.groups as unknown[]).push({
+                    displayName: `${quota.providerName} (BYOK)`,
+                    description: 'Limites & Saldo da Conta',
+                    buckets: [customBucket],
+                  });
+                  log.info(`[Proxy] Injected quota group for ${quota.providerName} into retrieveUserQuotaSummary`);
+                }
+              } catch (qErr) {
+                log.warn(`[Proxy] Failed to query quota for ${prov}:`, (qErr as Error).message);
+              }
+            }
+
+            const updatedJsonStr = JSON.stringify(parsed);
+            const updatedJsonBuf = Buffer.from(updatedJsonStr, 'utf8');
+
+            if (hasGrpcHeader) {
+              const newHeader = Buffer.alloc(5);
+              newHeader[0] = 0;
+              newHeader.writeUInt32BE(updatedJsonBuf.length, 1);
+              finalBuf = Buffer.concat([newHeader, updatedJsonBuf]);
+            } else {
+              finalBuf = updatedJsonBuf;
+            }
+          }
+        }
+      } catch (err) {
+        log.warn('[Proxy] Error injecting BYOK quota into retrieveUserQuotaSummary:', (err as Error).message);
+      }
+
+      const respHeaders: Record<string, string | string[] | undefined> = { ...googleRes.headers };
+      respHeaders['content-length'] = String(finalBuf.length);
+
+      res.writeHead(googleRes.statusCode || 200, respHeaders as Record<string, string>);
+      res.end(finalBuf);
+    });
+
+    googleRes.on('error', (err) => {
+      log.error('[Proxy] Google error for retrieveUserQuotaSummary:', err.message);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end();
+      }
+    });
+  });
+
+  googleReq.setTimeout(30_000, () => {
+    log.error('[Proxy] retrieveUserQuotaSummary forward timed out');
+    googleReq.destroy();
+    if (!res.headersSent) {
+      res.writeHead(504);
+      res.end();
+    }
+  });
+
+  googleReq.on('error', (err) => {
+    log.error('[Proxy] retrieveUserQuotaSummary forward error:', err.message);
+    if (!res.headersSent) {
+      res.writeHead(502);
+      res.end();
+    }
+  });
+
+  if (reqBody && reqBody.length > 0) {
+    googleReq.write(reqBody);
+  }
+  googleReq.end();
+}
+
 // ─── Main Request Handler ─────────────────────────────────────────────────
 
 function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  if (req.headers['authorization'] && typeof req.headers['authorization'] === 'string' && req.headers['authorization'].startsWith('Bearer ')) {
+    lastGoogleAuthHeader = req.headers['authorization'];
+  }
   req.url = req.url!.replace(/^.*\/dummy_path_padding/, '');
   // Strip binary patch padding (from LS hostname replacement)
-  req.url = req.url!.replace(/\/v1internal\/x{7}/, '');
+  req.url = req.url!.replace(/\/v1internal\/x+/, '');
 
   // Health check
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/healthz')) {
@@ -1192,6 +1974,174 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         timestamp: new Date().toISOString(),
       }),
     );
+    return;
+  }
+
+  // CORS preflight for frontend browser requests
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end();
+    return;
+  }
+
+  // Custom models endpoint for frontend UI sync
+  if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/customModels') || req.url.startsWith('/custom_models'))) {
+    const customModels = loadCustomModels();
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end(JSON.stringify({ models: customModels }));
+    return;
+  }
+
+  // Available providers metadata endpoint for frontend UI sync
+  if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/providers') || req.url.startsWith('/providers'))) {
+    const providers = registry.defaultRegistry.getAvailableProviders();
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end(JSON.stringify({ providers }));
+    return;
+  }
+
+  // Unified Quota summary endpoint for native IDE panel (Native Google + BYOK)
+  if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/quotaSummary') || req.url.startsWith('/quotaSummary'))) {
+    (async () => {
+      try {
+        let googleGroups = loadCachedGoogleQuotaGroups();
+        if (googleGroups.length === 0 && lastGoogleAuthHeader) {
+          googleGroups = await fetchGoogleQuotaSummaryProactively();
+        }
+
+        const groups: unknown[] = [...googleGroups];
+        const customModels = loadCustomModels();
+        const providersSeen = new Set<string>();
+
+        for (const cm of customModels) {
+          const prov = (cm.provider || '').toLowerCase().trim();
+          if (!prov || providersSeen.has(prov)) continue;
+          providersSeen.add(prov);
+
+          try {
+            const configured = loadProviders();
+            let key = cm.apiKey;
+            if ((!key || key === 'none' || key.startsWith('DECRYPTION_FAILED') || key.startsWith('enc:')) && configured[prov]?.apiKey) {
+              key = configured[prov].apiKey;
+            }
+            const quota = await fetchProviderQuota(prov, key, cm.apiUrl);
+            if (quota) {
+              const customBucket = {
+                displayName: 'Saldo Disponível',
+                description: quota.refreshText || (quota.balanceUsd !== undefined ? `$${quota.balanceUsd.toFixed(2)} restantes` : 'Ativo'),
+                remaining: {
+                  case: 'remainingFraction',
+                  value: quota.remainingFraction ?? 1.0,
+                },
+                remainingFraction: quota.remainingFraction ?? 1.0,
+              };
+
+              groups.push({
+                displayName: `${quota.providerName} (BYOK)`,
+                description: 'Limites & Saldo da Conta',
+                buckets: [customBucket],
+              });
+              log.info(`[Proxy] /v1internal/quotaSummary generated group for ${quota.providerName}`);
+            }
+          } catch (err) {
+            log.warn(`[Proxy] Failed to query quota for ${prov}:`, (err as Error).message);
+          }
+        }
+
+        const configuredProviders = loadProviders();
+        for (const [pKey, pVal] of Object.entries(configuredProviders)) {
+          const prov = pKey.toLowerCase().trim();
+          if (!prov || providersSeen.has(prov)) continue;
+          if (pVal && pVal.apiKey) {
+            providersSeen.add(prov);
+            try {
+              const quota = await fetchProviderQuota(prov, pVal.apiKey, pVal.apiUrl);
+              if (quota) {
+                const customBucket = {
+                  displayName: 'Saldo Disponível',
+                  description: quota.refreshText || (quota.balanceUsd !== undefined ? `$${quota.balanceUsd.toFixed(2)} restantes` : 'Ativo'),
+                  remaining: {
+                    case: 'remainingFraction',
+                    value: quota.remainingFraction ?? 1.0,
+                  },
+                  remainingFraction: quota.remainingFraction ?? 1.0,
+                };
+
+                groups.push({
+                  displayName: `${quota.providerName} (BYOK)`,
+                  description: 'Limites & Saldo da Conta',
+                  buckets: [customBucket],
+                });
+                log.info(`[Proxy] /v1internal/quotaSummary generated group for ${quota.providerName}`);
+              }
+            } catch (err) {
+              log.warn(`[Proxy] Failed to query quota for ${prov}:`, (err as Error).message);
+            }
+          }
+        }
+
+        normalizeQuotaGroups(groups);
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ groups }));
+      } catch (err) {
+        res.writeHead(500, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify({ groups: [], error: (err as Error).message }));
+      }
+    })();
+    return;
+  }
+
+  // Provider models listing endpoint
+  if (req.method === 'GET' && req.url && req.url.startsWith('/v1internal/providerModels')) {
+    (async () => {
+      try {
+        const parsed = new URL(req.url!, 'http://127.0.0.1:50999');
+        const provider = (parsed.searchParams.get('provider') || '').toLowerCase().trim();
+        const configured = loadProviders();
+        const provConfig = configured[provider];
+        const effectiveApiKey = parsed.searchParams.get('apiKey') || provConfig?.apiKey || '';
+        const effectiveApiUrl = parsed.searchParams.get('apiUrl') || provConfig?.apiUrl || undefined;
+
+        const models = await fetchProviderModelsList(provider, effectiveApiKey, effectiveApiUrl);
+        const hasConfiguredKey = !!(provConfig && provConfig.apiKey);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ models, hasConfiguredKey }));
+      } catch (err) {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(JSON.stringify({ models: [], error: (err as Error).message }));
+      }
+    })();
     return;
   }
 
@@ -1227,6 +2177,254 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
 
     log.info(`[Proxy] Request: ${req.method} ${req.url}`);
 
+    // Endpoint para sincronização do modelo selecionado na UI
+    if (req.method === 'POST' && req.url && (req.url.startsWith('/v1internal/selectModel') || req.url.startsWith('/selectModel'))) {
+      try {
+        const payload = JSON.parse(bodyStr || '{}') as {
+          label?: string;
+          isCustom?: boolean;
+          override?: Record<string, unknown>;
+          native?: boolean;
+        };
+        const customModels = loadCustomModels();
+        const providers = loadProviders();
+
+        if (payload.native || payload.isCustom === false) {
+          isNativeGoogleActive = true;
+          lastActiveCustomModel = undefined;
+          log.info(`[Proxy] Model selected in UI: ${payload.label || 'Native Google'} (Native Google active)`);
+        } else {
+          isNativeGoogleActive = false;
+          const resolved = resolveTargetCustomModel({
+            model: payload.label,
+            customModelInfoOverride: payload.override,
+          }, customModels, providers);
+
+          if (resolved) {
+            lastActiveCustomModel = resolved;
+            log.info(`[Proxy] Model selected in UI: ${resolved.displayName} (${resolved.provider}/${resolved.externalModelName || resolved.name})`);
+          } else if (payload.override) {
+            const ov = payload.override;
+            const modelName = (ov.modelName || ov.model_name || payload.label || 'custom-model') as string;
+            const chatModelName = (ov.chatModelName || ov.chat_model_name || payload.label || modelName) as string;
+            const effortVal = (ov.effort || ov.reasoningEffort || ov.reasoning_effort) as string | undefined;
+            let prov = 'openrouter';
+            let extModel = modelName;
+            const slashIdx = modelName.indexOf('/');
+            if (slashIdx !== -1) {
+              const prefix = modelName.substring(0, slashIdx).toLowerCase();
+              if (providers[prefix]) {
+                prov = prefix;
+                extModel = modelName.substring(slashIdx + 1);
+              }
+            }
+            const provConfig = providers[prov] || providers['openrouter'] || {};
+            lastActiveCustomModel = {
+              name: `models/${modelName.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+              displayName: chatModelName,
+              description: `Custom model selected via UI (${prov})`,
+              provider: prov,
+              apiKey: provConfig.apiKey || '',
+              apiUrl: provConfig.apiUrl || '',
+              externalModelName: extModel,
+              effort: effortVal ? String(effortVal).toLowerCase() : undefined,
+            };
+            log.info(`[Proxy] Model selected in UI (dynamic override): ${chatModelName} (${prov}/${extModel})`);
+          }
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ ok: true, active: lastActiveCustomModel?.displayName || 'native' }));
+        return;
+      } catch (err) {
+        log.error('[Proxy] Failed to process selectModel request:', err);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid payload' }));
+        return;
+      }
+    }
+
+    // Endpoint para resolução dinâmica de specs de modelo
+    if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/resolveModelSpec')) {
+      (async () => {
+        try {
+          const body = JSON.parse(bodyStr || '{}');
+          const spec = await resolveModelSpec(body.modelId, body.contextWindow, body.maxOutputTokens);
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+          });
+          res.end(JSON.stringify(spec));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: (err as Error).message }));
+        }
+      })();
+      return;
+    }
+
+    // Endpoint para salvar modelo customizado
+    if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/saveCustomModel')) {
+      (async () => {
+        try {
+          const bodyObj = JSON.parse(bodyStr || '{}');
+          const model = bodyObj as CustomModel;
+          const oldLabel = (bodyObj.oldLabel || bodyObj.oldModelName) as string | undefined;
+          if (!model.name && !model.displayName) {
+            res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ success: false, error: 'Model name or displayName is required' }));
+            return;
+          }
+
+          const prov = (model.provider || '').toLowerCase().trim();
+          const configuredProviders = loadProviders();
+          const provConfig = configuredProviders[prov];
+
+          let effectiveApiKey = model.apiKey ? model.apiKey.trim() : '';
+          if (!effectiveApiKey && provConfig?.apiKey) {
+            effectiveApiKey = provConfig.apiKey;
+          }
+
+          if (effectiveApiKey && !effectiveApiKey.startsWith('enc:') && effectiveApiKey !== 'none') {
+            model.apiKey = cryptoStore.encryptString(effectiveApiKey);
+            model.encrypted = true;
+          } else if (effectiveApiKey) {
+            model.apiKey = effectiveApiKey;
+          }
+
+          if (!model.apiUrl && provConfig?.apiUrl) {
+            model.apiUrl = provConfig.apiUrl;
+          }
+
+          if (!model.maxTokens || !model.maxOutputTokens) {
+            const spec = await resolveModelSpec(model.externalModelName || model.name, model.maxTokens, model.maxOutputTokens);
+            model.maxTokens = model.maxTokens || spec.contextWindow;
+            model.maxOutputTokens = model.maxOutputTokens || spec.maxOutputTokens;
+          }
+
+          const existingModels = loadCustomModels();
+          const identifier = model.displayName || model.name;
+          const idx = existingModels.findIndex((m) =>
+            (oldLabel && ((m.displayName || m.name) === oldLabel || m.name === oldLabel || m.externalModelName === oldLabel)) ||
+            (m.displayName || m.name) === identifier ||
+            m.externalModelName === model.externalModelName
+          );
+          if (idx !== -1) {
+            existingModels[idx] = { ...existingModels[idx], ...model };
+          } else {
+            existingModels.push(model);
+          }
+
+          const customModelsPath = path.join(os.homedir(), '.gemini', 'antigravity-ide', 'custom_models.json');
+          let currentConfig: { providers?: ProvidersMap; models?: CustomModel[] } = {};
+          try {
+            if (fs.existsSync(customModelsPath)) {
+              currentConfig = JSON.parse(fs.readFileSync(customModelsPath, 'utf8'));
+            }
+          } catch (_) {}
+
+          if (!currentConfig.providers) currentConfig.providers = {};
+          if (prov && effectiveApiKey && effectiveApiKey !== 'none') {
+            if (!currentConfig.providers[prov]) {
+              currentConfig.providers[prov] = { apiKey: effectiveApiKey, apiUrl: model.apiUrl || '' };
+            } else if (model.apiKey && !model.apiKey.startsWith('enc:')) {
+              currentConfig.providers[prov].apiKey = effectiveApiKey;
+            }
+          }
+
+          // Re-encrypt any plaintext models before persisting to disk
+          const encryptedModels = cryptoStore.encryptModels(existingModels);
+          currentConfig.models = encryptedModels;
+
+          fs.mkdirSync(path.dirname(customModelsPath), { recursive: true });
+          fs.writeFileSync(customModelsPath, JSON.stringify(currentConfig, null, 2), 'utf8');
+          log.info(`[Proxy] Model "${model.displayName || model.name}" saved to custom_models.json via HTTP API`);
+
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+          });
+          res.end(JSON.stringify({ success: true, model }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+        }
+      })();
+      return;
+    }
+
+    // Endpoint para excluir modelo customizado
+    if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/deleteCustomModel')) {
+      try {
+        const { modelName } = JSON.parse(bodyStr || '{}');
+        const existingModels = loadCustomModels();
+        const filtered = existingModels.filter((m) => (m.displayName || m.name) !== modelName && m.externalModelName !== modelName && m.name !== modelName);
+        const customModelsPath = path.join(os.homedir(), '.gemini', 'antigravity-ide', 'custom_models.json');
+
+        let currentConfig: { providers?: ProvidersMap; models?: CustomModel[] } = {};
+        try {
+          if (fs.existsSync(customModelsPath)) {
+            currentConfig = JSON.parse(fs.readFileSync(customModelsPath, 'utf8'));
+          }
+        } catch (_) {}
+
+        currentConfig.models = cryptoStore.encryptModels(filtered);
+        fs.writeFileSync(customModelsPath, JSON.stringify(currentConfig, null, 2), 'utf8');
+        log.info(`[Proxy] Model "${modelName}" deleted via HTTP API`);
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    // Endpoint para teste de conexão com provedor
+    if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/testConnection')) {
+      (async () => {
+        try {
+          const { provider, apiKey, apiUrl } = JSON.parse(bodyStr || '{}');
+          const prov = (provider || '').toLowerCase().trim();
+          const configured = loadProviders();
+          const provConfig = configured[prov];
+          const effectiveApiKey = apiKey || provConfig?.apiKey || '';
+          const effectiveApiUrl = apiUrl || provConfig?.apiUrl || undefined;
+
+          const models = await fetchProviderModelsList(prov, effectiveApiKey, effectiveApiUrl);
+          const success = Array.isArray(models) && models.length > 0;
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+          });
+          res.end(JSON.stringify({
+            success,
+            message: success ? `Conectado com sucesso! Encontrados ${models.length} modelos.` : 'Nenhum modelo retornado.',
+          }));
+        } catch (err) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+        }
+      })();
+      return;
+    }
+
     // 0. Intercept GetAvailableModels (redirected from Electron webRequest)
     if (req.url!.startsWith('/GetAvailableModels')) {
       const gavParsed = new URL(req.url!, 'http://127.0.0.1');
@@ -1237,6 +2435,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       }
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing ls parameter' }));
+      return;
+    }
+
+    // Intercept retrieveUserQuotaSummary (gRPC-web protobuf)
+    if (req.url!.includes('retrieveUserQuotaSummary')) {
+      handleRetrieveUserQuotaSummaryProxy(req, res, fullBody);
       return;
     }
 
@@ -1430,35 +2634,20 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               googleJson.agentModelSorts = [googleJson.agentModelSorts];
             }
 
-            // Inject custom model slugs AND placeholder IDs into agentModelSorts
-            // Compute slugs directly (including reasoning effort variants)
-            const customModelIds: string[] = [];
-            customModels.forEach((m) => {
-              const baseSlug = toSlug(m);
-              const levels = m.reasoningEffortLevels && m.reasoningEffortLevels.length > 0 ? m.reasoningEffortLevels : [null];
-              for (const lvl of levels) {
-                const slug = lvl ? `${baseSlug}-${lvl.toLowerCase()}` : baseSlug;
-                customModelIds.push(slug);
-              }
-            });
+            // Custom models are registered above in googleJson.models and handled in the native "Custom" group
+            log.info(`[Proxy] Registered ${customModels.length} custom model(s) for capability lookup (managed in Custom group)`);
 
-            if (customModelIds.length > 0) {
-              const sorts = googleJson.agentModelSorts as { groups?: { modelIds?: string[] }[] }[];
-              for (const sort of sorts) {
-                if (sort.groups && Array.isArray(sort.groups)) {
-                  for (const group of sort.groups) {
-                    if (!group.modelIds) {
-                      group.modelIds = [];
-                    }
-                    for (const id of customModelIds) {
-                      if (!group.modelIds.includes(id)) {
-                        group.modelIds.push(id);
-                      }
-                    }
-                  }
-                }
-              }
-              log.info(`[Proxy] Injected ${customModelIds.length} custom model IDs into agentModelSorts`);
+            if (typeof googleJson.defaultAgentModelId === 'string' && googleJson.defaultAgentModelId) {
+              cachedGoogleDefaultModel = googleJson.defaultAgentModelId;
+              log.info(`[Proxy] Captured Google default agent model from fetchAvailableModels: ${cachedGoogleDefaultModel}`);
+            } else if (
+              Array.isArray(googleJson.agentModelSorts) &&
+              (googleJson.agentModelSorts as Record<string, unknown>[])[0]?.groups &&
+              Array.isArray(((googleJson.agentModelSorts as Record<string, unknown>[])[0].groups as Record<string, unknown>[])[0]?.modelIds) &&
+              (((googleJson.agentModelSorts as Record<string, unknown>[])[0].groups as Record<string, unknown>[])[0].modelIds as string[]).length > 0
+            ) {
+              cachedGoogleDefaultModel = (((googleJson.agentModelSorts as Record<string, unknown>[])[0].groups as Record<string, unknown>[])[0].modelIds as string[])[0];
+              log.info(`[Proxy] Captured Google default agent model from agentModelSorts: ${cachedGoogleDefaultModel}`);
             }
 
             try {
@@ -1659,21 +2848,55 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           return;
         }
 
-        if (modelName || modelId) {
-          const customModels = loadCustomModels();
-          const matchedCustomModel = matchCustomModelWithEffort(customModels, modelName, modelId);
-          if (matchedCustomModel) {
+        const customModels = loadCustomModels();
+        const providers = loadProviders();
+        let matchedCustomModel = resolveTargetCustomModel(reqJson, customModels, providers);
+
+        // Se a requisição não trouxe override explícito (ex: conversas antigas ou serialização Go omitida),
+        // mas o usuário selecionou um modelo customizado ativo:
+        if (!matchedCustomModel && !isNativeGoogleActive && lastActiveCustomModel) {
+          if (!modelName || modelName.includes('custom') || modelName.includes('undefined')) {
+            matchedCustomModel = { ...lastActiveCustomModel };
             log.info(
-              `[Proxy] Intercepting Cloud Code generation for custom model: ${modelName} => ${matchedCustomModel.displayName}${matchedCustomModel.effort ? ` (effort: ${matchedCustomModel.effort})` : ''}`,
+              `[Proxy] Roteamento via modelo ativo selecionado: ${matchedCustomModel.displayName} (${matchedCustomModel.provider}/${matchedCustomModel.externalModelName || matchedCustomModel.name})`,
             );
-            const isStream = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
-            const actualGeminiBody = (reqJson.request || reqJson) as GeminiRequestBody;
-            // Resolve fileData URIs then route to translator
-            resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-              handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
-            });
-            return;
           }
+        }
+
+        // Fallback se a requisição veio sem modelo definido
+        if (!matchedCustomModel && !modelName && !modelId) {
+          const reqType = (reqJson.requestType || (reqJson.request as Record<string, unknown> | undefined)?.requestType) as string | undefined;
+          const isBackground = typeof reqType === 'string' && reqType !== 'CHAT_MESSAGE_REQUEST_TYPE_USER' && reqType !== 'CHAT_MESSAGE_REQUEST_TYPE_DEFAULT';
+
+          const fallbackModel = getGoogleDefaultModel();
+          if (!isBackground) {
+            log.info(
+              `[Proxy] Requisição sem modelo explícito; aplicando fallback para modelo nativo Google (${fallbackModel})...`,
+            );
+          }
+          reqJson.model = fallbackModel;
+          if (reqJson.request && typeof reqJson.request === 'object') {
+            (reqJson.request as Record<string, unknown>).model = fallbackModel;
+          }
+          if ('modelId' in reqJson || 'model_id' in reqJson) {
+            delete reqJson.modelId;
+            delete reqJson.model_id;
+          }
+          proxyToGoogle(req, res, Buffer.from(JSON.stringify(reqJson), 'utf8'));
+          return;
+        }
+
+        if (matchedCustomModel) {
+          log.info(
+            `[Proxy] Intercepting Cloud Code generation for custom model: ${matchedCustomModel.displayName} (${matchedCustomModel.provider}/${matchedCustomModel.externalModelName || matchedCustomModel.name})${matchedCustomModel.effort ? ` (effort: ${matchedCustomModel.effort})` : ''}`,
+          );
+          const isStream = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
+          const actualGeminiBody = (reqJson.request || reqJson) as GeminiRequestBody;
+          // Resolve fileData URIs then route to translator
+          resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
+            handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
+          });
+          return;
         }
 
         // Clean up non-standard internal fields (modelId/model_id) before proxying native Google Cloud Code requests
@@ -1719,11 +2942,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       }
 
       const customModels = loadCustomModels();
-      const matchedCustomModel = matchCustomModelWithEffort(customModels, matchedModelName);
+      const providers = loadProviders();
+      let geminiBody: GeminiRequestBody = {};
+      try { geminiBody = JSON.parse(bodyStr) as GeminiRequestBody; } catch (_) {}
+      const matchedCustomModel = resolveTargetCustomModel({ model: matchedModelName, request: geminiBody }, customModels, providers);
 
       if (matchedCustomModel) {
         try {
-          const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
           resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
             handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream);
           });

@@ -1,5 +1,10 @@
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { safeStorage } = require('electron');
+let safeStorage: any;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  safeStorage = require('electron').safeStorage;
+} catch {
+  safeStorage = undefined;
+}
 import * as fs from 'fs';
 
 /**
@@ -84,7 +89,7 @@ export function decryptString(encryptedText: string): string {
   return encryptedText;
 }
 
-interface ModelWithKey {
+export interface ModelWithKey {
   apiKey?: string;
   encrypted?: boolean;
   provider?: string;
@@ -94,7 +99,7 @@ interface ModelWithKey {
 /**
  * Iterates through a list of custom models and encrypts their API keys.
  */
-export function encryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
+export function encryptModels<T extends { apiKey?: string; encrypted?: boolean; provider?: string }>(models: T[] | null): T[] {
   if (!models || !Array.isArray(models)) return [];
   return models.map((model) => {
     if (model.apiKey && model.apiKey !== 'none' && !model.encrypted) {
@@ -111,7 +116,7 @@ export function encryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
 /**
  * Iterates through a list of custom models and decrypts their API keys for in-memory use.
  */
-export function decryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
+export function decryptModels<T extends { apiKey?: string; encrypted?: boolean; provider?: string }>(models: T[] | null): T[] {
   if (!models || !Array.isArray(models)) return [];
   return models.map((model) => {
     if (model.encrypted) {
@@ -124,3 +129,4 @@ export function decryptModels(models: ModelWithKey[] | null): ModelWithKey[] {
     return model;
   });
 }
+

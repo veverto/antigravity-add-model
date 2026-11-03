@@ -10,6 +10,8 @@ import { StorageManager } from './storage';
 import { getAutoSwitchConfigPath, loadAutoSwitchPolicy, saveAutoSwitchPolicy } from './autoSwitch/config';
 import { AutoSwitchPolicy, AutoSwitchRoute } from './autoSwitch/types';
 import { VerifiableModel, verifyModel } from './autoSwitch/verifier';
+import { fetchProviderModelsList } from './proxy/adapters';
+import { resolveModelSpec } from './proxy/modelSpecs';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const cryptoStore = require('./cryptoStore');
@@ -18,6 +20,35 @@ const cryptoStore = require('./cryptoStore');
  * Registers all IPC handlers for the main process.
  */
 export function registerIpcHandlers(storageManager: StorageManager): void {
+  // Provider models dynamic listing
+  ipcMain.handle(
+    'storage:fetch-provider-models',
+    async (_event, params: { provider: string; apiKey?: string; apiUrl?: string }) => {
+      let actualKey = params.apiKey;
+      if (actualKey && actualKey.includes('...')) {
+        try {
+          const geminiDir = path.join(app.getPath('home'), '.gemini', 'antigravity-ide');
+          const filePath = path.join(geminiDir, 'custom_models.json');
+          const content = await fs.readFile(filePath, 'utf-8');
+          const parsed = JSON.parse(content) as { models?: CustomModelFileEntry[] };
+          const matched = (parsed.models || []).find((m) => m.provider === params.provider && m.apiKey);
+          if (matched && matched.apiKey) {
+            actualKey = cryptoStore.decryptString(matched.apiKey) as string;
+          }
+        } catch (_) {}
+      }
+      return fetchProviderModelsList(params.provider, actualKey, params.apiUrl);
+    },
+  );
+
+  // Model spec resolver (auto-detection of context and output limits)
+  ipcMain.handle(
+    'storage:resolve-model-spec',
+    async (_event, params: { modelId: string; providedContext?: number; providedOutput?: number }) => {
+      return resolveModelSpec(params.modelId, params.providedContext, params.providedOutput);
+    },
+  );
+
   // IDE detection — the renderer polls this to decide whether to show IDE
   // integration features.  Returning true because Antigravity itself is the IDE.
   ipcMain.handle('ide:is-installed', async () => true);
@@ -160,6 +191,17 @@ export function registerIpcHandlers(storageManager: StorageManager): void {
         if (!keyToStore.startsWith('enc:') && !keyToStore.startsWith('fallback:')) {
           keyToStore = cryptoStore.encryptString(keyToStore);
         }
+      }
+
+      // Ensure maxTokens and maxOutputTokens are always resolved automatically
+      if (!newModel.maxTokens || Number(newModel.maxTokens) <= 0) {
+        const spec = await resolveModelSpec(
+          newModel.externalModelName || newModel.name,
+          newModel.maxTokens ? Number(newModel.maxTokens) : undefined,
+          newModel.maxOutputTokens ? Number(newModel.maxOutputTokens) : undefined,
+        );
+        newModel.maxTokens = spec.contextWindow;
+        newModel.maxOutputTokens = spec.maxOutputTokens;
       }
 
       const modelEntry: CustomModelFileEntry = {

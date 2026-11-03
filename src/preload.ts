@@ -49,6 +49,8 @@ interface StorageAPI {
   saveCustomModel: (model: CustomModelEntry) => Promise<{ success: boolean; error?: string }>;
   deleteCustomModel: (modelName: string) => Promise<{ success: boolean; error?: string }>;
   testModelConnection: (model: TestModelParams) => Promise<ConnectionTestResult>;
+  fetchProviderModels: (params: { provider: string; apiKey?: string; apiUrl?: string }) => Promise<any[]>;
+  resolveModelSpec: (params: { modelId: string; providedContext?: number; providedOutput?: number }) => Promise<{ contextWindow: number; maxOutputTokens: number }>;
 }
 
 interface VerifyModelResult {
@@ -192,6 +194,8 @@ const storageAPI: StorageAPI = {
   saveCustomModel: (model) => ipcRenderer.invoke('storage:save-custom-model', model),
   deleteCustomModel: (modelName) => ipcRenderer.invoke('storage:delete-custom-model', modelName),
   testModelConnection: (model) => ipcRenderer.invoke('storage:test-model-connection', model),
+  fetchProviderModels: (params) => ipcRenderer.invoke('storage:fetch-provider-models', params),
+  resolveModelSpec: (params) => ipcRenderer.invoke('storage:resolve-model-spec', params),
 };
 
 const autoSwitchAPI: AutoSwitchAPI = {
@@ -1014,10 +1018,12 @@ window.addEventListener('DOMContentLoaded', () => {
     await renderCustomModelsList();
   }
 
-  function openAddModelModal(): void {
+  function openAddModelModal(initialProvider?: string): void {
     // Remove existing modal if any
     const existing = document.getElementById('agy-modal-overlay');
     if (existing) existing.remove();
+
+    const isOffline = typeof navigator !== 'undefined' && !navigator.onLine;
 
     // Modal overlay backdrop
     const overlay = document.createElement('div');
@@ -1039,7 +1045,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // Modal card container
     const modal = document.createElement('div');
     modal.id = 'agy-modal-card';
-    modal.style.width = '520px';
+    modal.style.width = '540px';
     modal.style.maxHeight = '90vh';
     modal.style.overflowY = 'auto';
     modal.style.backgroundColor = '#18181b';
@@ -1053,7 +1059,7 @@ window.addEventListener('DOMContentLoaded', () => {
     modal.style.transition = 'transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)';
 
     modal.innerHTML = `
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <div style="display: flex; align-items: center; gap: 10px;">
                     <div id="agy-modal-provider-icon" style="width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; background-color: #10a37f18; color: #10a37f;">${PROVIDER_ICONS.openai}</div>
                     <h3 style="margin: 0; font-size: 20px; font-weight: 600; color: #f4f4f5;">Add Custom AI Model</h3>
@@ -1061,16 +1067,26 @@ window.addEventListener('DOMContentLoaded', () => {
                 <button id="agy-modal-close" style="background: transparent; border: none; color: #a1a1aa; cursor: pointer; font-size: 20px; line-height: 1; padding: 4px; display: flex; align-items: center; justify-content: center; transition: color 0.15s ease;">&times;</button>
             </div>
 
+            ${
+              isOffline
+                ? `
+            <div id="agy-offline-banner" style="background-color: #ef444420; border: 1px solid #ef444460; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #fca5a5; display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
+                <span style="font-size: 16px;">⚠️</span>
+                <span><strong>Você está offline.</strong> Conecte-se à internet para listar e adicionar modelos com validação de limites.</span>
+            </div>`
+                : ''
+            }
+
             <div style="display: flex; flex-direction: column; gap: 16px; margin-bottom: 24px;">
                 <!-- Provider -->
                 <div style="display: flex; flex-direction: column; gap: 6px;">
                     <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API Provider</label>
                     <select id="agy-provider" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; cursor: pointer; transition: border-color 0.15s ease;">
+                        <option value="openrouter">OpenRouter</option>
                         <option value="openai">OpenAI (ChatGPT)</option>
                         <option value="anthropic">Anthropic (Claude)</option>
                         <option value="google">Google AI Studio (Gemini)</option>
                         <option value="ollama">Ollama (Local)</option>
-                        <option value="openrouter">OpenRouter</option>
                         <option value="deepseek">DeepSeek</option>
                         <option value="groq">Groq</option>
                         <option value="mistral">Mistral</option>
@@ -1084,23 +1100,49 @@ window.addEventListener('DOMContentLoaded', () => {
                     </select>
                 </div>
 
-                <!-- Model ID -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
+                <!-- API Key -->
+                <div id="agy-key-container" style="display: flex; flex-direction: column; gap: 6px;">
+                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API Key <span id="agy-key-required" style="color: #ef4444;">*</span></label>
+                    <input type="password" id="agy-api-key" placeholder="Enter API key" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
+                </div>
+
+                <!-- Popular Models Section -->
+                <div id="agy-popular-container" style="display: flex; flex-direction: column; gap: 6px;">
+                    <label style="font-size: 12px; font-weight: 500; color: #a1a1aa; display: flex; align-items: center; gap: 4px;">
+                        <span>⭐ Modelos Populares (1 clique)</span>
+                        <span id="agy-models-loading" style="display: none; font-size: 11px; color: #60a5fa; margin-left: auto;">Carregando catálogo...</span>
+                    </label>
+                    <div id="agy-popular-pills" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+                </div>
+
+                <!-- Model ID / Search Input with Dropdown -->
+                <div style="position: relative; display: flex; flex-direction: column; gap: 6px;">
                     <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">Model Name / ID <span style="color: #ef4444;">*</span></label>
-                    <input type="text" id="agy-model-id" placeholder="e.g. gpt-4o" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" required />
+                    <input type="text" id="agy-model-id" placeholder="Digite para buscar ou selecione..." autocomplete="off" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" required />
                     <div id="agy-model-id-error" style="font-size: 11px; color: #ef4444; display: none; margin-top: 2px;"></div>
+                    <div id="agy-model-dropdown" style="display: none; position: absolute; top: 100%; left: 0; right: 0; max-height: 220px; overflow-y: auto; background-color: #1f1f23; border: 1px solid #3f3f46; border-radius: 8px; z-index: 1000; box-shadow: 0 10px 20px rgba(0,0,0,0.5); margin-top: 4px; padding: 4px;"></div>
                 </div>
 
                 <!-- Friendly Display Name -->
                 <div style="display: flex; flex-direction: column; gap: 6px;">
                     <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">Friendly Display Name</label>
-                    <input type="text" id="agy-display-name" placeholder="e.g. GPT-4o (OpenAI)" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
+                    <input type="text" id="agy-display-name" placeholder="e.g. Gemini 2.5 Flash" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
                 </div>
 
-                <!-- API Key -->
-                <div id="agy-key-container" style="display: flex; flex-direction: column; gap: 6px;">
-                    <label style="font-size: 13px; font-weight: 500; color: #a1a1aa;">API Key <span id="agy-key-required" style="color: #ef4444;">*</span></label>
-                    <input type="password" id="agy-api-key" placeholder="Enter API key" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #f4f4f5; padding: 10px 12px; font-size: 14px; outline: none; transition: border-color 0.15s ease;" />
+                <!-- Limits & Context Display Badges (Read-Only / Auto-detected) -->
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                    <label style="font-size: 12px; font-weight: 500; color: #a1a1aa;">Limites Detectados Automaticamente (Zero Configuração Manual)</label>
+                    <div id="agy-limits-container" style="display: flex; gap: 12px; align-items: center; background-color: #202024; border: 1px solid #3f3f46; border-radius: 8px; padding: 8px 12px; font-size: 12px;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="color: #60a5fa;">🌐 Context Window:</span>
+                            <strong id="agy-badge-context" style="color: #93c5fd;">1.048.576 tokens (1M)</strong>
+                        </div>
+                        <div style="width: 1px; height: 14px; background-color: #52525b;"></div>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="color: #34d399;">📤 Saída Máxima:</span>
+                            <strong id="agy-badge-output" style="color: #6ee7b7;">8.192 tokens (8k)</strong>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- API URL -->
@@ -1121,7 +1163,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 </button>
                 <div style="display: flex; gap: 12px;">
                     <button id="agy-btn-cancel" style="background-color: #27272a; border: 1px solid #3f3f46; border-radius: 8px; color: #e4e4e7; padding: 10px 18px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background-color 0.15s ease, color 0.15s ease;">Cancel</button>
-                    <button id="agy-btn-save" style="background-color: #e4e4e7; border: none; border-radius: 8px; color: #18181b; padding: 10px 22px; font-size: 14px; font-weight: 500; cursor: pointer; transition: background-color 0.15s ease, opacity 0.15s ease;">Save Model</button>
+                    <button id="agy-btn-save" ${isOffline ? 'disabled' : ''} style="background-color: #e4e4e7; border: none; border-radius: 8px; color: #18181b; padding: 10px 22px; font-size: 14px; font-weight: 500; cursor: ${isOffline ? 'not-allowed' : 'pointer'}; opacity: ${isOffline ? '0.4' : '1'}; transition: background-color 0.15s ease, opacity 0.15s ease;">Save Model</button>
                 </div>
             </div>
         `;
@@ -1161,6 +1203,16 @@ window.addEventListener('DOMContentLoaded', () => {
     const keyRequired = document.getElementById('agy-key-required')!;
     const testBtn = document.getElementById('agy-btn-test') as HTMLButtonElement;
     const saveBtn = document.getElementById('agy-btn-save') as HTMLButtonElement;
+    const popularPills = document.getElementById('agy-popular-pills')!;
+    const modelDropdown = document.getElementById('agy-model-dropdown')!;
+    const modelsLoading = document.getElementById('agy-models-loading')!;
+    const badgeContext = document.getElementById('agy-badge-context')!;
+    const badgeOutput = document.getElementById('agy-badge-output')!;
+
+    // Limites atualmente detectados para o modelo ativo
+    let currentContextWindow = 128_000;
+    let currentMaxOutput = 8_192;
+    let availableModels: any[] = [];
 
     const prefilledUrls: Record<string, string> = {
       openai: 'https://api.openai.com/v1/chat/completions',
@@ -1177,6 +1229,121 @@ window.addEventListener('DOMContentLoaded', () => {
       llamacpp: 'http://localhost:8080/v1',
       nvidia: 'https://integrate.api.nvidia.com/v1',
       custom: '',
+    };
+
+    const formatTokens = (num: number): string => {
+      if (num >= 1_000_000) return `${num.toLocaleString('pt-BR')} (${(num / 1_000_000).toFixed(num % 1_000_000 === 0 ? 0 : 1)}M)`;
+      if (num >= 1_000) return `${num.toLocaleString('pt-BR')} (${Math.round(num / 1000)}k)`;
+      return num.toLocaleString('pt-BR');
+    };
+
+    const updateLimitsBadges = (ctx: number, out: number) => {
+      currentContextWindow = ctx;
+      currentMaxOutput = out;
+      badgeContext.textContent = formatTokens(ctx);
+      badgeOutput.textContent = formatTokens(out);
+    };
+
+    const selectModelItem = (item: { id: string; name?: string; contextWindow?: number; maxOutputTokens?: number }) => {
+      modelInput.value = item.id;
+      if (!nameInput.value || nameInput.value.includes('(')) {
+        nameInput.value = item.name || item.id;
+      }
+      if (item.contextWindow && item.maxOutputTokens) {
+        updateLimitsBadges(item.contextWindow, item.maxOutputTokens);
+      } else {
+        storageAPI
+          .resolveModelSpec({ modelId: item.id, providedContext: item.contextWindow, providedOutput: item.maxOutputTokens })
+          .then((spec) => updateLimitsBadges(spec.contextWindow, spec.maxOutputTokens))
+          .catch(() => {});
+      }
+      modelDropdown.style.display = 'none';
+      validateModelId();
+    };
+
+    // Renderiza pílulas de modelos populares
+    const renderPopularPills = (models: any[]) => {
+      popularPills.innerHTML = '';
+      const populars = models.filter((m) => m.isPopular).slice(0, 8);
+      if (populars.length === 0) {
+        popularPills.innerHTML = '<span style="font-size: 11px; color: #71717a;">Selecione ou digite o nome do modelo abaixo</span>';
+        return;
+      }
+      populars.forEach((m) => {
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.style.cssText =
+          'background-color: #27272a; border: 1px solid #3f3f46; border-radius: 6px; padding: 4px 8px; font-size: 11px; color: #e4e4e7; cursor: pointer; transition: all 0.15s ease; display: inline-flex; align-items: center; gap: 4px;';
+        pill.innerHTML = `<span>⭐</span><span>${m.name || m.id}</span>`;
+        pill.addEventListener('mouseenter', () => {
+          pill.style.backgroundColor = '#3f3f46';
+          pill.style.borderColor = '#60a5fa';
+        });
+        pill.addEventListener('mouseleave', () => {
+          pill.style.backgroundColor = '#27272a';
+          pill.style.borderColor = '#3f3f46';
+        });
+        pill.addEventListener('click', () => selectModelItem(m));
+        popularPills.appendChild(pill);
+      });
+    };
+
+    // Busca modelos via IPC
+    const loadProviderModels = async (provider: string) => {
+      if (isOffline) return;
+      modelsLoading.style.display = 'inline';
+      try {
+        const apiKey = keyInput.value.trim();
+        const apiUrl = urlInput.value.trim();
+        const list = await storageAPI.fetchProviderModels({ provider, apiKey, apiUrl });
+        availableModels = list || [];
+        renderPopularPills(availableModels);
+      } catch (_) {
+        renderPopularPills([]);
+      } finally {
+        modelsLoading.style.display = 'none';
+      }
+    };
+
+    // Filtro do dropdown de modelos enquanto digita
+    const filterModelDropdown = () => {
+      const query = modelInput.value.trim().toLowerCase();
+      if (!query || availableModels.length === 0) {
+        modelDropdown.style.display = 'none';
+        return;
+      }
+
+      const matches = availableModels.filter(
+        (m) => m.id.toLowerCase().includes(query) || (m.name && m.name.toLowerCase().includes(query)),
+      );
+
+      if (matches.length === 0) {
+        modelDropdown.style.display = 'none';
+        return;
+      }
+
+      modelDropdown.innerHTML = '';
+      matches.slice(0, 10).forEach((m) => {
+        const item = document.createElement('div');
+        item.style.cssText =
+          'padding: 8px 10px; cursor: pointer; border-radius: 6px; font-size: 13px; display: flex; justify-content: space-between; align-items: center; color: #f4f4f5; transition: background 0.1s ease;';
+        item.innerHTML = `
+            <div style="display: flex; flex-direction: column; gap: 2px;">
+                <span style="font-weight: 500;">${m.name || m.id}</span>
+                <span style="font-size: 11px; color: #a1a1aa;">${m.id}</span>
+            </div>
+            ${m.contextWindow ? `<span style="font-size: 10px; background-color: #3b82f620; color: #60a5fa; padding: 2px 6px; border-radius: 4px;">${formatTokens(m.contextWindow)}</span>` : ''}
+        `;
+        item.addEventListener('mouseenter', () => {
+          item.style.backgroundColor = '#2e2e34';
+        });
+        item.addEventListener('mouseleave', () => {
+          item.style.backgroundColor = 'transparent';
+        });
+        item.addEventListener('click', () => selectModelItem(m));
+        modelDropdown.appendChild(item);
+      });
+      modelDropdown.style.display = 'block';
     };
 
     // Real-time URL validation
@@ -1205,7 +1372,7 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     };
 
-    // Model ID validation
+    // Model ID validation & dynamic limit lookup
     const validateModelId = () => {
       const val = modelInput.value.trim();
       if (val && !/^[a-zA-Z0-9._/:-]+$/.test(val)) {
@@ -1216,15 +1383,29 @@ window.addEventListener('DOMContentLoaded', () => {
         modelIdError.style.display = 'none';
         modelInput.style.borderColor = '#3f3f46';
       }
+
+      if (val) {
+        storageAPI
+          .resolveModelSpec({ modelId: val })
+          .then((spec) => updateLimitsBadges(spec.contextWindow, spec.maxOutputTokens))
+          .catch(() => {});
+      }
     };
 
     urlInput.addEventListener('input', validateUrl);
     modelInput.addEventListener('input', () => {
       validateModelId();
+      filterModelDropdown();
       if (providerSelect.value === 'google') {
         const modelId = modelInput.value.trim() || 'model-name';
         urlInput.value = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`;
         validateUrl();
+      }
+    });
+
+    document.addEventListener('click', (e) => {
+      if (e.target !== modelInput && !modelDropdown.contains(e.target as Node)) {
+        modelDropdown.style.display = 'none';
       }
     });
 
@@ -1248,12 +1429,15 @@ window.addEventListener('DOMContentLoaded', () => {
         keyContainer.style.display = 'none';
         keyInput.value = '';
         keyRequired.style.display = 'none';
-        modelInput.placeholder = 'e.g. llama3';
-        nameInput.placeholder = 'e.g. Llama 3 (Ollama)';
+        modelInput.placeholder = 'e.g. llama3.3';
+        nameInput.placeholder = 'e.g. Llama 3.3 (Ollama)';
       } else {
         keyContainer.style.display = 'flex';
         keyRequired.style.display = 'inline';
-        if (val === 'openai') {
+        if (val === 'openrouter') {
+          modelInput.placeholder = 'e.g. google/gemini-2.5-flash';
+          nameInput.placeholder = 'e.g. Gemini 2.5 Flash';
+        } else if (val === 'openai') {
           modelInput.placeholder = 'e.g. gpt-4o';
           nameInput.placeholder = 'e.g. GPT-4o (OpenAI)';
         } else if (val === 'anthropic') {
@@ -1269,14 +1453,20 @@ window.addEventListener('DOMContentLoaded', () => {
       }
 
       validateUrl();
+      loadProviderModels(val);
     };
 
     providerSelect.addEventListener('change', updatePrefills);
 
+    // Initial provider setup
+    if (initialProvider && prefilledUrls[initialProvider] !== undefined) {
+      providerSelect.value = initialProvider;
+    }
+    updatePrefills();
+
     // ─── Test Connection in Modal ────────────────────
     testBtn.addEventListener('click', async () => {
       const provider = providerSelect.value;
-      const modelId = modelInput.value.trim();
       const apiKey = keyInput.value.trim();
       const apiUrl = urlInput.value.trim();
 
@@ -1327,6 +1517,11 @@ window.addEventListener('DOMContentLoaded', () => {
     });
 
     saveBtn.addEventListener('click', async () => {
+      if (isOffline) {
+        alert('Não é possível adicionar modelos enquanto estiver offline.');
+        return;
+      }
+
       const provider = providerSelect.value;
       const modelId = modelInput.value.trim();
       let displayName = nameInput.value.trim();
@@ -1384,13 +1579,23 @@ window.addEventListener('DOMContentLoaded', () => {
 
       if (!displayName) {
         const providerNames: Record<string, string> = {
-          openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google Studio',
-          ollama: 'Ollama', openrouter: 'OpenRouter', custom: 'Custom',
-          deepseek: 'DeepSeek', groq: 'Groq', mistral: 'Mistral',
-          cerebras: 'Cerebras', kimi: 'Kimi', fireworks: 'Fireworks',
-          lmstudio: 'LM Studio', llamacpp: 'llama.cpp', nvidia: 'NVIDIA',
+          openai: 'OpenAI',
+          anthropic: 'Anthropic',
+          google: 'Google Studio',
+          ollama: 'Ollama',
+          openrouter: 'OpenRouter',
+          custom: 'Custom',
+          deepseek: 'DeepSeek',
+          groq: 'Groq',
+          mistral: 'Mistral',
+          cerebras: 'Cerebras',
+          kimi: 'Kimi',
+          fireworks: 'Fireworks',
+          lmstudio: 'LM Studio',
+          llamacpp: 'llama.cpp',
+          nvidia: 'NVIDIA',
         };
-        displayName = `${modelId} (${providerNames[provider]})`;
+        displayName = `${modelId} (${providerNames[provider] || provider})`;
       }
 
       const newModel: CustomModelEntry = {
@@ -1401,6 +1606,8 @@ window.addEventListener('DOMContentLoaded', () => {
         apiKey: apiKey || 'none',
         apiUrl: apiUrl,
         externalModelName: modelId,
+        maxTokens: currentContextWindow || 128_000,
+        maxOutputTokens: currentMaxOutput || 8_192,
       };
 
       saveBtn.disabled = true;
@@ -1431,6 +1638,14 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     });
   }
+
+  // Expor no window e via CustomEvent para integração com o dropdown da IDE
+  try {
+    (window as any).openAddModelModal = openAddModelModal;
+    window.addEventListener('agy:open-add-model', (e: any) => {
+      openAddModelModal(e?.detail?.provider);
+    });
+  } catch (_) {}
 
   /**
    * Chat-first control: it changes only the persisted routing mode. Native model

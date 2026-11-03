@@ -21,6 +21,11 @@ import {
   StreamContext,
 } from '../shared';
 import { detectModelCapabilitiesByName } from '../modelUtils';
+import {
+  cleanSystemInstruction,
+  DEFAULT_WORKING_CONTEXT_BUDGET,
+  ModelTokenConfig,
+} from './openai';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -43,6 +48,7 @@ interface AnthropicTool {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
+  cache_control?: { type: 'ephemeral' };
 }
 
 interface GeminiContent {
@@ -88,6 +94,7 @@ interface AnthropicContentBlock {
   input?: Record<string, unknown>;
   tool_use_id?: string;
   content?: string | AnthropicContentBlock[];
+  cache_control?: { type: 'ephemeral' };
 }
 
 type AnthropicMessageRole = 'user' | 'assistant';
@@ -100,7 +107,7 @@ interface AnthropicMessage {
 interface AnthropicRequestBody {
   model: string;
   messages: AnthropicMessage[];
-  system?: string;
+  system?: string | AnthropicContentBlock[];
   max_tokens: number;
   temperature?: number;
   tools?: AnthropicTool[];
@@ -174,16 +181,41 @@ function mapGeminiToolsToAnthropic(geminiTools: GeminiTool[]): AnthropicTool[] {
   return anthropicTools;
 }
 
-export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: string): AnthropicRequestBody {
+export function mapGeminiToAnthropic(
+  geminiBody: GeminiRequestBody,
+  modelName: string,
+  tokenConfig?: ModelTokenConfig,
+): AnthropicRequestBody {
   const messages: AnthropicMessage[] = [];
-  let system: string | undefined = undefined;
+  let systemText: string | undefined = undefined;
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
-    system = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
+    const raw = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
+    systemText = cleanSystemInstruction(raw);
+  }
+
+  const isCacheSupported = /openrouter|anthropic|claude/i.test(modelName);
+
+  // Identify active turn start index (latest user message that isn't a tool response)
+  let activeStartIdx = -1;
+  if (geminiBody.contents) {
+    for (let i = geminiBody.contents.length - 1; i >= 0; i--) {
+      const item = geminiBody.contents[i];
+      const isToolResp = item.parts?.some((p) => p.functionResponse);
+      const isUser = item.role === 'user' || !item.role;
+      if (isUser && !isToolResp) {
+        activeStartIdx = i;
+        break;
+      }
+    }
+  }
+  if (activeStartIdx === -1 && geminiBody.contents && geminiBody.contents.length > 0) {
+    activeStartIdx = geminiBody.contents.length - 1;
   }
 
   if (geminiBody.contents) {
-    for (const item of geminiBody.contents) {
+    for (let itemIdx = 0; itemIdx < geminiBody.contents.length; itemIdx++) {
+      const item = geminiBody.contents[itemIdx];
       if (item.parts) {
         const hasFunctionCall = item.parts.some((p) => p.functionCall);
         const hasFunctionResponse = item.parts.some((p) => p.functionResponse);
@@ -228,6 +260,11 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
               } else {
                 contentStr = typeof responseData === 'string' ? responseData : JSON.stringify(responseData || {});
               }
+              // Soft compression / Tombstoning: if this tool result is from an earlier turn and exceeds 400 chars, truncate
+              if (itemIdx < activeStartIdx && contentStr.length > 400) {
+                const origLen = contentStr.length;
+                contentStr = contentStr.slice(0, 300) + `\n... [Older tool output truncated: ${origLen} chars to preserve context budget]`;
+              }
               contentBlocks.push({
                 type: 'tool_result',
                 tool_use_id: toolCallId,
@@ -249,7 +286,7 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
             content = partsContent.join('\n');
           }
           if (roleStr === 'system') {
-            system = (system || '') + '\n' + content;
+            systemText = (systemText || '') + '\n' + content;
           } else {
             messages.push({ role: roleStr as AnthropicMessageRole, content });
           }
@@ -258,11 +295,52 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
     }
   }
 
+  // Inject multi-point prompt caching into penultimate message
+  if (isCacheSupported && messages.length >= 3) {
+    for (let i = messages.length - 2; i >= 1; i--) {
+      const msg = messages[i];
+      if (Array.isArray(msg.content) && msg.content.length > 0) {
+        const lastBlock = msg.content[msg.content.length - 1];
+        lastBlock.cache_control = { type: 'ephemeral' };
+        break;
+      } else if (typeof msg.content === 'string' && msg.content.trim().length > 0) {
+        msg.content = [
+          {
+            type: 'text',
+            text: msg.content,
+            cache_control: { type: 'ephemeral' },
+          },
+        ];
+        break;
+      }
+    }
+  }
+
+  let systemPayload: string | AnthropicContentBlock[] | undefined = undefined;
+  if (systemText) {
+    if (isCacheSupported) {
+      systemPayload = [
+        {
+          type: 'text',
+          text: systemText,
+          cache_control: { type: 'ephemeral' },
+        },
+      ];
+    } else {
+      systemPayload = systemText;
+    }
+  }
+
+  const maxTokens = Math.min(
+    geminiBody.generationConfig?.maxOutputTokens ?? tokenConfig?.maxOutputTokens ?? 16000,
+    16384,
+  );
+
   const result: AnthropicRequestBody = {
     model: modelName,
     messages,
-    system,
-    max_tokens: geminiBody.generationConfig?.maxOutputTokens ?? 16000,
+    system: systemPayload,
+    max_tokens: maxTokens,
   };
 
   // Claude thinking models don't support temperature (centralized detection)
@@ -274,7 +352,12 @@ export function mapGeminiToAnthropic(geminiBody: GeminiRequestBody, modelName: s
 
   if (geminiBody.tools && Array.isArray(geminiBody.tools)) {
     const anthTools = mapGeminiToolsToAnthropic(geminiBody.tools);
-    if (anthTools.length > 0) result.tools = anthTools;
+    if (anthTools.length > 0) {
+      if (isCacheSupported) {
+        anthTools[anthTools.length - 1].cache_control = { type: 'ephemeral' };
+      }
+      result.tools = anthTools;
+    }
   }
 
   return result;

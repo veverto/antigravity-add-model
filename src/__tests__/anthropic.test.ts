@@ -26,13 +26,19 @@ beforeEach(() => {
 // ─── mapGeminiToAnthropic ──────────────────────────────────────────────────
 
 describe('mapGeminiToAnthropic', () => {
-  it('should convert systemInstruction to system parameter', () => {
+  it('should convert systemInstruction to system parameter with cache_control for Claude models', () => {
     const body = {
       systemInstruction: { parts: [{ text: 'You are helpful.' }] },
       contents: [],
     };
     const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
-    expect(result.system).toBe('You are helpful.');
+    expect(result.system).toEqual([
+      {
+        type: 'text',
+        text: 'You are helpful.',
+        cache_control: { type: 'ephemeral' },
+      },
+    ]);
   });
 
   it('should convert user messages', () => {
@@ -342,5 +348,37 @@ describe('mapAnthropicChunkToGemini', () => {
     const r2 = mapAnthropicChunkToGemini(chunk2, 'claude-3-5-sonnet-latest');
     expect(r1).not.toBeNull();
     expect(r2).not.toBeNull();
+  });
+
+  it('attaches cache_control to the last tool and penultimate message for Claude models', () => {
+    const body = {
+      systemInstruction: { parts: [{ text: 'System' }] },
+      tools: [
+        {
+          functionDeclarations: [
+            { name: 'read_file', description: 'reads file', parameters: { type: 'OBJECT' } },
+            { name: 'write_file', description: 'writes file', parameters: { type: 'OBJECT' } },
+          ],
+        },
+      ],
+      contents: [
+        { role: 'user', parts: [{ text: 'Step 1' }] },
+        { role: 'model', parts: [{ text: 'Step 1 complete' }] },
+        { role: 'user', parts: [{ text: 'Step 2' }] },
+      ],
+    };
+
+    const result = mapGeminiToAnthropic(body, 'claude-3-5-sonnet-latest');
+
+    // Last tool has cache_control
+    expect(result.tools).toBeDefined();
+    expect(result.tools![result.tools!.length - 1].cache_control).toEqual({ type: 'ephemeral' });
+    // First tool does NOT have cache_control
+    expect(result.tools![0].cache_control).toBeUndefined();
+
+    // Penultimate message has cache_control
+    const penultimate = result.messages[result.messages.length - 2];
+    expect(Array.isArray(penultimate.content)).toBe(true);
+    expect((penultimate.content as any)[0].cache_control).toEqual({ type: 'ephemeral' });
   });
 });

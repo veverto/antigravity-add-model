@@ -1,21 +1,32 @@
 /**
  * Provider Translator Registry.
- * Auto-discovers translator modules and provides a unified interface for request/response mapping.
  *
- * To add a new provider:
- *   1. Create a file in ./translators/ named <provider>.ts
- *   2. Export: mapGeminiTo<Provider>, map<Provider>ToGemini, map<Provider>ChunkToGemini
- *   3. The registry detects it automatically — no config changes needed.
+ * Gerencia a hierarquia de classes BaseProvider através de um catálogo declarativo
+ * tipado (REGISTERED_PROVIDERS), eliminando dependências frágeis de fs.readdirSync.
+ *
+ * Expõe a classe ProviderRegistry e funções utilitárias que mantêm 100% de compatibilidade
+ * com o proxy.ts, autoSwitch/verifier.ts e a suíte de testes existente.
  */
 
-import * as path from 'path';
-import * as fs from 'fs';
 import log from 'electron-log';
+import {
+  ModelTokenConfig,
+  ProviderHeaders,
+  ProviderQuotaInfo,
+  ProviderMetadata,
+  GeminiRequestBody,
+} from './types';
+import {
+  BaseProvider,
+  REGISTERED_PROVIDERS,
+} from './providers';
+import { normalizeChatCompletionsUrl } from './modelUtils';
 
-// ─── Types ────────────────────────────────────────────────────────────────
+// Re-export types
+export { ModelTokenConfig, ProviderHeaders, ProviderQuotaInfo, ProviderMetadata, normalizeChatCompletionsUrl };
 
 export interface TranslatorModule {
-  mapGeminiToOpenAI?: (body: unknown, modelName: string, effort?: string) => unknown;
+  mapGeminiToOpenAI?: (body: unknown, modelName: string, effort?: string, tokenConfig?: ModelTokenConfig) => unknown;
   mapOpenAIToGemini?: (res: unknown, modelName: string) => unknown;
   mapOpenAIChunkToGemini?: (chunk: unknown, modelName: string) => unknown | null;
   mapGeminiToAnthropic?: (body: unknown, modelName: string) => unknown;
@@ -28,165 +39,188 @@ export interface TranslatorModule {
   [key: string]: unknown;
 }
 
-export interface ProviderHeaders {
-  'Content-Type': string;
-  Authorization?: string;
-  'x-api-key'?: string;
-  'anthropic-version'?: string;
-  'x-goog-api-key'?: string;
-  'HTTP-Referer'?: string;
-  'X-Title'?: string;
-  [key: string]: string | undefined;
-}
+// Grupos de compatibilidade de transporte
+const OPENAI_COMPAT = new Set([
+  'openai', 'ollama', 'openrouter', 'custom', 'groq', 'mistral',
+  'cerebras', 'nvidia', 'opencode', 'codestral', 'together',
+  'deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'wafer', 'zai',
+]);
+const ANTHROPIC_COMPAT = new Set(['anthropic']);
 
-// ─── Registry State ───────────────────────────────────────────────────────
+// ─── ProviderRegistry (Classe Central) ────────────────────────────────────
 
-const translators = new Map<string, TranslatorModule>();
+export class ProviderRegistry {
+  private instances = new Map<string, BaseProvider>();
 
-// ─── Auto-Discovery ───────────────────────────────────────────────────────
+  constructor(providers = REGISTERED_PROVIDERS) {
+    for (const ProviderClass of providers) {
+      this.register(ProviderClass);
+    }
+  }
 
-function loadTranslators(): void {
-  const translatorDir = path.join(__dirname, 'translators');
+  register(ProviderClass: (typeof REGISTERED_PROVIDERS)[number]): void {
+    try {
+      const instance = new ProviderClass();
+      this.instances.set(ProviderClass.id.toLowerCase(), instance);
+    } catch (err) {
+      log.error(`[ProviderRegistry] Falha ao registrar provedor "${ProviderClass.id}":`, (err as Error).message);
+    }
+  }
 
-  try {
-    const files = fs.readdirSync(translatorDir).filter((f) => f.endsWith('.js') && f !== 'utils.js');
+  get(providerId: string): BaseProvider | null {
+    const norm = (providerId || '').toLowerCase().trim();
+    if (this.instances.has(norm)) {
+      return this.instances.get(norm)!;
+    }
+    if (OPENAI_COMPAT.has(norm)) {
+      return this.instances.get('openai') || null;
+    }
+    if (ANTHROPIC_COMPAT.has(norm)) {
+      return this.instances.get('anthropic') || null;
+    }
+    if (norm === 'google') {
+      return this.instances.get('google') || null;
+    }
+    return this.instances.get('openai') || null;
+  }
 
-    for (const file of files) {
-      const provider = path.basename(file, '.js');
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const mod = require(path.join(translatorDir, file)) as TranslatorModule;
-        translators.set(provider, mod);
-        log.info(`[TranslatorRegistry] Loaded provider translator: "${provider}"`);
-      } catch (err) {
-        log.error(`[TranslatorRegistry] Failed to load translator "${provider}":`, (err as Error).message);
+  /**
+   * Retorna os metadados de todos os provedores registrados para alimentar a UI.
+   */
+  getAvailableProviders(): ProviderMetadata[] {
+    return REGISTERED_PROVIDERS.map((P) => ({
+      id: P.id,
+      displayName: P.displayName,
+      defaultBaseUrl: P.defaultBaseUrl,
+      isLocal: P.isLocal ?? false,
+    }));
+  }
+
+  translateRequest(
+    provider: string,
+    geminiBody: unknown,
+    modelName: string,
+    effort?: string,
+    tokenConfig?: ModelTokenConfig,
+  ): unknown {
+    const p = this.get(provider);
+    if (p) {
+      return p.translateRequest(geminiBody as GeminiRequestBody, modelName, effort, tokenConfig);
+    }
+    return geminiBody;
+  }
+
+  translateResponse(provider: string, providerRes: unknown, modelName: string): unknown {
+    const p = this.get(provider);
+    if (p) {
+      return p.translateResponse(providerRes, modelName);
+    }
+    return providerRes;
+  }
+
+  translateStreamChunk(provider: string, chunk: unknown, modelName: string): unknown {
+    const p = this.get(provider);
+    if (p) {
+      return p.translateStreamChunk(chunk, modelName);
+    }
+    return null;
+  }
+
+  getProviderHeaders(provider: string, apiKey: string): ProviderHeaders {
+    const p = this.get(provider);
+    if (p) {
+      return p.getHeaders(apiKey);
+    }
+    return { 'Content-Type': 'application/json' };
+  }
+
+  getProviderUrl(
+    baseUrl: string,
+    modelName: string,
+    isStream: boolean,
+    providerOrTranslator?: string | TranslatorModule | null,
+  ): string {
+    if (typeof providerOrTranslator === 'string') {
+      const p = this.get(providerOrTranslator);
+      if (p) return p.getUrl(baseUrl, modelName, isStream);
+    }
+    // Suporte a compatibilidade com translators legados
+    if (providerOrTranslator && typeof providerOrTranslator === 'object') {
+      if (typeof (providerOrTranslator as Record<string, unknown>).getGoogleApiUrl === 'function') {
+        return ((providerOrTranslator as Record<string, unknown>).getGoogleApiUrl as (...args: unknown[]) => string)(baseUrl, modelName, isStream);
+      }
+      if (typeof (providerOrTranslator as Record<string, unknown>).getOllamaApiUrl === 'function') {
+        return ((providerOrTranslator as Record<string, unknown>).getOllamaApiUrl as (...args: unknown[]) => string)(baseUrl);
       }
     }
-  } catch (err) {
-    log.error('[TranslatorRegistry] Failed to scan translators directory:', (err as Error).message);
+    return normalizeChatCompletionsUrl(baseUrl);
   }
 
-  log.info(
-    `[TranslatorRegistry] ${translators.size} provider translator(s) loaded: ${[...translators.keys()].join(', ')}`,
-  );
+  async getQuota(provider: string, apiKey?: string, apiUrl?: string): Promise<ProviderQuotaInfo | null> {
+    const p = this.get(provider);
+    if (p) {
+      return p.getQuota(apiKey, apiUrl);
+    }
+    return null;
+  }
+
+  supportsStreaming(provider: string): boolean {
+    const p = this.get(provider);
+    return p ? p.supportsStreaming() : true;
+  }
 }
 
-// Providers grouped by transport compatibility
-const OPENAI_COMPAT = new Set(['openai', 'ollama', 'openrouter', 'custom', 'groq', 'mistral', 'cerebras', 'nvidia', 'opencode', 'codestral']);
-const ANTHROPIC_COMPAT = new Set(['anthropic', 'deepseek', 'kimi', 'fireworks', 'lmstudio', 'llamacpp', 'wafer', 'zai']);
+export const defaultRegistry = new ProviderRegistry();
 
-// ─── Public API ───────────────────────────────────────────────────────────
+// ─── Funções Facade para Compatibilidade com proxy.ts e verifier.ts ───────
 
 export function getTranslator(provider: string): TranslatorModule | null {
-  if (OPENAI_COMPAT.has(provider)) return translators.get('openai') || null;
-  if (ANTHROPIC_COMPAT.has(provider)) return translators.get('anthropic') || null;
-  if (provider === 'google') return translators.get('google') || null;
-  return translators.get('openai') || null;
+  const p = defaultRegistry.get(provider);
+  if (!p) return null;
+  return {
+    mapGeminiToOpenAI: (body, modelName, effort, tokenConfig) => p.translateRequest(body as GeminiRequestBody, modelName, effort, tokenConfig),
+    mapOpenAIToGemini: (res, modelName) => p.translateResponse(res, modelName),
+    mapOpenAIChunkToGemini: (chunk, modelName) => p.translateStreamChunk(chunk, modelName),
+    mapGeminiToAnthropic: (body, modelName) => p.translateRequest(body as GeminiRequestBody, modelName),
+    mapAnthropicToGemini: (res, modelName) => p.translateResponse(res, modelName),
+    mapAnthropicChunkToGemini: (chunk, modelName) => p.translateStreamChunk(chunk, modelName),
+    mapGeminiToGoogle: (body, modelName) => p.translateRequest(body as GeminiRequestBody, modelName),
+    mapGoogleToGemini: (res, modelName) => p.translateResponse(res, modelName),
+    mapGoogleChunkToGemini: (chunk, modelName) => p.translateStreamChunk(chunk, modelName),
+  };
 }
 
-export function translateRequest(provider: string, geminiBody: unknown, modelName: string, effort?: string): unknown {
-  const t = getTranslator(provider);
-
-  if (provider === 'google') return geminiBody;
-  if (OPENAI_COMPAT.has(provider)) return t?.mapGeminiToOpenAI ? t.mapGeminiToOpenAI(geminiBody, modelName, effort) : geminiBody;
-  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapGeminiToAnthropic ? t.mapGeminiToAnthropic(geminiBody, modelName) : geminiBody;
-
-  // Generic: try mapGeminiTo<Provider> convention
-  const fnName = `mapGeminiTo${provider.charAt(0).toUpperCase() + provider.slice(1)}`;
-  if (t && typeof t[fnName] === 'function') {
-    return (t[fnName] as (...args: unknown[]) => unknown)(geminiBody, modelName, effort);
-  }
-
-  log.warn(`[TranslatorRegistry] No request translator for provider "${provider}", passing through`);
-  return geminiBody;
+export function translateRequest(
+  provider: string,
+  geminiBody: unknown,
+  modelName: string,
+  effort?: string,
+  tokenConfig?: ModelTokenConfig,
+): unknown {
+  return defaultRegistry.translateRequest(provider, geminiBody, modelName, effort, tokenConfig);
 }
 
 export function translateResponse(provider: string, providerRes: unknown, modelName: string): unknown {
-  const t = getTranslator(provider);
-
-  if (provider === 'google') return providerRes;
-  if (OPENAI_COMPAT.has(provider)) return t?.mapOpenAIToGemini ? t.mapOpenAIToGemini(providerRes, modelName) : providerRes;
-  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapAnthropicToGemini ? t.mapAnthropicToGemini(providerRes, modelName) : providerRes;
-
-  const fnName = `map${provider.charAt(0).toUpperCase() + provider.slice(1)}ToGemini`;
-  if (t && typeof t[fnName] === 'function') {
-    return (t[fnName] as (...args: unknown[]) => unknown)(providerRes, modelName);
-  }
-
-  log.warn(`[TranslatorRegistry] No response translator for provider "${provider}", passing through`);
-  return providerRes;
+  return defaultRegistry.translateResponse(provider, providerRes, modelName);
 }
 
 export function translateStreamChunk(provider: string, chunk: unknown, modelName: string): unknown {
-  const t = getTranslator(provider);
-
-  if (provider === 'google') return t?.mapGoogleChunkToGemini ? t.mapGoogleChunkToGemini(chunk, modelName) : null;
-  if (OPENAI_COMPAT.has(provider)) return t?.mapOpenAIChunkToGemini ? t.mapOpenAIChunkToGemini(chunk, modelName) : null;
-  if (ANTHROPIC_COMPAT.has(provider)) return t?.mapAnthropicChunkToGemini ? t.mapAnthropicChunkToGemini(chunk, modelName) : null;
-
-  const fnName = `map${provider.charAt(0).toUpperCase() + provider.slice(1)}ChunkToGemini`;
-  if (t && typeof t[fnName] === 'function') {
-    return (t[fnName] as (...args: unknown[]) => unknown)(chunk, modelName);
-  }
-
-  return null;
+  return defaultRegistry.translateStreamChunk(provider, chunk, modelName);
 }
 
 export function getProviderHeaders(provider: string, apiKey: string): ProviderHeaders {
-  const headers: ProviderHeaders = { 'Content-Type': 'application/json' };
-  if (!apiKey || apiKey === 'none') return headers;
-
-  if (provider === 'anthropic' || ANTHROPIC_COMPAT.has(provider)) {
-    headers['x-api-key'] = apiKey;
-    headers['anthropic-version'] = '2025-04-01';
-  } else if (provider === 'google') {
-    headers['x-goog-api-key'] = apiKey;
-  } else if (provider === 'openrouter') {
-    headers['Authorization'] = `Bearer ${apiKey}`;
-    headers['HTTP-Referer'] = 'https://antigravity.google';
-    headers['X-Title'] = 'Antigravity';
-  } else if (provider !== 'ollama') {
-    headers['Authorization'] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
-
-export function supportsStreaming(provider: string): boolean {
-  return OPENAI_COMPAT.has(provider) || ANTHROPIC_COMPAT.has(provider) || provider === 'google';
-}
-
-// ─── URL Helpers ──────────────────────────────────────────────────────────
-
-/**
- * Appends the OpenAI-compatible chat endpoint when the user supplied only a
- * base URL. Shared with the Auto Switch verifier so a probe always hits the
- * exact URL the proxy will use for real traffic.
- */
-export function normalizeChatCompletionsUrl(baseUrl: string): string {
-  const lower = baseUrl.toLowerCase();
-  if (lower.includes('/chat/completions') || lower.includes('/completions')) return baseUrl;
-  if (baseUrl.endsWith('/v1')) return baseUrl + '/chat/completions';
-  if (!baseUrl.endsWith('/')) return baseUrl + '/v1/chat/completions';
-  return baseUrl + 'v1/chat/completions';
+  return defaultRegistry.getProviderHeaders(provider, apiKey);
 }
 
 export function getProviderUrl(
   baseUrl: string,
   modelName: string,
   isStream: boolean,
-  translator: TranslatorModule | null,
+  translator?: TranslatorModule | null,
 ): string {
-  // Google AI Studio: dynamic streaming vs non-streaming URL
-  if (translator && typeof translator['getGoogleApiUrl'] === 'function') {
-    return (translator['getGoogleApiUrl'] as (...args: unknown[]) => string)(baseUrl, modelName, isStream);
-  }
-  // Ollama: normalize to standard /v1/chat/completions endpoint
-  if (translator && typeof translator['getOllamaApiUrl'] === 'function') {
-    return (translator['getOllamaApiUrl'] as (...args: unknown[]) => string)(baseUrl);
-  }
-  return baseUrl;
+  return defaultRegistry.getProviderUrl(baseUrl, modelName, isStream, translator);
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────────
-
-loadTranslators();
+export function supportsStreaming(provider: string): boolean {
+  return defaultRegistry.supportsStreaming(provider);
+}

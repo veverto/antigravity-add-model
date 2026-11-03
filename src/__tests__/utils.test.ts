@@ -212,6 +212,31 @@ describe('translateToolCallToNative', () => {
     expect(result.args).toHaveProperty('CaseInsensitive', true);
   });
 
+  it('should NOT translate multi-file cat or chained commands with redirection', () => {
+    const result = translateToolCallToNative('run_command', {
+      CommandLine: 'cat part1.md part2.md part3.md > historia.md && wc -w historia.md',
+      Cwd: '/home/user',
+    });
+    expect(result.name).toBe('run_command');
+    expect(result.args.CommandLine).toBe('cat part1.md part2.md part3.md > historia.md && wc -w historia.md');
+  });
+
+  it('should NOT translate cat with redirection', () => {
+    const result = translateToolCallToNative('run_command', {
+      CommandLine: 'cat a.txt b.txt > c.txt',
+      Cwd: '/tmp',
+    });
+    expect(result.name).toBe('run_command');
+  });
+
+  it('should NOT translate pipelines like ls | grep', () => {
+    const result = translateToolCallToNative('run_command', {
+      CommandLine: 'ls | grep foo',
+      Cwd: '/tmp',
+    });
+    expect(result.name).toBe('run_command');
+  });
+
   it('should pass through unknown commands', () => {
     const result = translateToolCallToNative('run_command', {
       CommandLine: 'npm install',

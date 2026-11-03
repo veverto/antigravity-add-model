@@ -36,13 +36,23 @@ describe('schemaValidator - reasoningEffortLevels', () => {
     expect(res.error).toContain('must be an array of strings');
   });
 
-  it('should reject invalid effort level strings', () => {
+  it('should accept valid maxTokens and maxOutputTokens numbers', () => {
     const model = {
       ...baseValidModel,
-      reasoningEffortLevels: ['Low', 'SuperHigh'],
+      maxTokens: 8192,
+      maxOutputTokens: 8192,
+    };
+    expect(validateCustomModel(model)).toEqual({ valid: true });
+  });
+
+  it('should reject non-positive or non-number maxTokens', () => {
+    const model = {
+      ...baseValidModel,
+      maxTokens: -100,
     };
     const res = validateCustomModel(model);
     expect(res.valid).toBe(false);
-    expect(res.error).toContain('Invalid reasoning effort level');
+    expect(res.error).toContain('maxTokens must be a positive number');
   });
 });
+

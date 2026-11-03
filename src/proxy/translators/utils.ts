@@ -425,40 +425,54 @@ export function translateToolCallToNative(name: string, args: ToolCallArgs): Tra
   const cmd = args.CommandLine.trim();
   const cwd = args.Cwd || process.cwd();
 
-  // 1. list_dir translation
-  const isListDir = /^(ls|dir)(\s+[\w\-\/\.\*]+)*$/i.test(cmd);
-  if (isListDir) {
-    let dirPath = cwd;
-    const tokens = cmd.split(/\s+/).slice(1);
-    const pathToken = tokens.find((t) => !t.startsWith('-') && !t.startsWith('/'));
-    if (pathToken) {
-      dirPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
-    }
-    log.info(`[Proxy] Translating run_command "${cmd}" to list_dir on "${dirPath}"`);
-    return { name: 'list_dir', args: { DirectoryPath: dirPath } };
+  // If command uses chaining (&&, ||, ;, &) or pipes (|), it is a shell pipeline and must NOT be translated
+  const hasChainingOrPipe = /(&&|\|\||[;|])/.test(cmd);
+  if (hasChainingOrPipe) {
+    return { name, args: args as Record<string, unknown> };
   }
 
-  // 2. view_file translation
-  const catMatch = /^(cat|type)\s+(["']?)(.*?)\2$/i.exec(cmd);
-  if (catMatch) {
-    const filePath = catMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to view_file on "${absPath}"`);
-    return { name: 'view_file', args: { AbsolutePath: absPath } };
+  // 1. list_dir translation (simple ls or dir, no redirects)
+  if (!/[><]/.test(cmd)) {
+    const isListDir = /^(ls|dir)(\s+[\w\-\/\.\*]+)*$/i.test(cmd);
+    if (isListDir) {
+      let dirPath = cwd;
+      const tokens = cmd.split(/\s+/).slice(1);
+      const pathToken = tokens.find((t) => !t.startsWith('-') && !t.startsWith('/'));
+      if (pathToken) {
+        dirPath = path.isAbsolute(pathToken) ? pathToken : path.resolve(cwd, pathToken);
+      }
+      log.info(`[Proxy] Translating run_command "${cmd}" to list_dir on "${dirPath}"`);
+      return { name: 'list_dir', args: { DirectoryPath: dirPath } };
+    }
+  }
+
+  // 2. view_file translation: ONLY simple single-file reads (no redirects, no multiple files, no flags)
+  if (!/[><]/.test(cmd)) {
+    const catMatch = /^(cat|type)\s+(?:(["'])(.*?)\2|([^\s"'>;&|]+))$/i.exec(cmd);
+    if (catMatch) {
+      const filePath = (catMatch[3] !== undefined ? catMatch[3] : catMatch[4]).trim();
+      if (filePath && !filePath.startsWith('-')) {
+        const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+        log.info(`[Proxy] Translating run_command "${cmd}" to view_file on "${absPath}"`);
+        return { name: 'view_file', args: { AbsolutePath: absPath } };
+      }
+    }
   }
 
   // 2b. write_file translation (echo redirect)
-  const echoRedirectMatch = /^(echo|printf)\s+(.+?)\s*>\s*(.+)$/i.exec(cmd);
+  const echoRedirectMatch = /^(echo|printf)\s+(.+?)\s*>{1,2}\s*(.+)$/i.exec(cmd);
   if (echoRedirectMatch) {
     const content = echoRedirectMatch[2].replace(/^["']|["']$/g, '');
     const filePath = echoRedirectMatch[3].trim();
-    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-    log.info(`[Proxy] Translating run_command "${cmd}" to write_file on "${absPath}"`);
-    return { name: 'write_file', args: { AbsolutePath: absPath, Content: content, Append: cmd.includes('>>') } };
+    if (filePath && !/[><|;&]/.test(filePath)) {
+      const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
+      log.info(`[Proxy] Translating run_command "${cmd}" to write_file on "${absPath}"`);
+      return { name: 'write_file', args: { AbsolutePath: absPath, Content: content, Append: cmd.includes('>>') } };
+    }
   }
 
-  // 3. grep_search translation
-  if (cmd.toLowerCase().startsWith('grep') || cmd.toLowerCase().startsWith('findstr')) {
+  // 3. grep_search translation (simple grep without redirects)
+  if (!/[><]/.test(cmd) && (cmd.toLowerCase().startsWith('grep') || cmd.toLowerCase().startsWith('findstr'))) {
     let query = '';
     let searchPath = cwd;
     const regexQuotes = /"([^"]+)"|'([^']+)'/g;
