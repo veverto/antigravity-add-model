@@ -9,6 +9,11 @@ export interface ModelSpec {
   supportsImages?: boolean;
 }
 
+export interface ModelPricing {
+  inputPerMillion: number;
+  outputPerMillion: number;
+}
+
 export interface ProviderModelItem {
   id: string;               // Identificador do modelo na API (ex: "google/gemini-2.5-flash")
   name: string;             // Nome amigável de exibição

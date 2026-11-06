@@ -50,6 +50,13 @@ function deployProxyModules(targetAppDir) {
     }
   }
 
+  for (const helperFile of ['hubInterceptor.js', 'modalCode.js']) {
+    const srcHelper = path.join(__dirname, helperFile);
+    if (fs.existsSync(srcHelper)) {
+      fs.copyFileSync(srcHelper, path.join(proxyDir, helperFile));
+    }
+  }
+
   for (const sub of ['proxy', 'autoSwitch', 'services']) {
     const srcSub = path.join(distDir, sub);
     const destSub = path.join(proxyDir, sub);
@@ -90,6 +97,8 @@ if (fs.existsSync(customModelsPath)) {
 console.log(`[Patch-IDE] Loaded ${customModels.length} custom models from custom_models.json`);
 
 const customModelsJsonLiteral = JSON.stringify(customModels);
+
+const makeByokSettingsCardSnippet = (fn) => `${fn}("div",{className:"rounded-xl border border-border bg-card p-4 space-y-3 mb-4"},[${fn}("div",{className:"flex items-center justify-between"},[${fn}("div",{className:"flex flex-col gap-0.5"},[${fn}("h3",{className:"m-0 text-sm font-semibold text-foreground flex items-center gap-2"},[${fn}("span",{},"BYOK Provider & Cost Management")]),${fn}("p",{className:"m-0 text-xs text-muted-foreground leading-relaxed"},"Manage configured custom providers, cost badges, and provider token overrides.")]),${fn}("button",{type:"button",onClick:()=>window.openByokSettingsModal?.("cost")||window.openCostSettingsModal?.()||window.openAddModelModal?.(null,null,"cost"),className:"rounded-md px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors cursor-pointer"},"Configure BYOK...")])]),`;
 
 // 1. Patch workbench.desktop.main.js
 if (fs.existsSync(wbPath)) {
@@ -259,11 +268,15 @@ if (fs.existsSync(wbPath)) {
 
     // F. Responsive max-h & custom scrollbar
     const tqdTarget = 'TQd=()=>v("div",{"data-testid":JJd,className:"flex flex-col max-h-80 overflow-hidden outline-none"';
-    const tqdReplacement = 'TQd=()=>v("div",{"data-testid":JJd,className:"flex flex-col max-h-[min(540px,75vh)] outline-none"';
+    const tqdOldNoHidden = 'TQd=()=>v("div",{"data-testid":JJd,className:"flex flex-col max-h-[min(540px,75vh)] outline-none"';
+    const tqdReplacement = 'TQd=()=>v("div",{"data-testid":JJd,className:"flex flex-col max-h-[min(540px,75vh)] overflow-hidden outline-none"';
     if (wbCode.includes(tqdTarget)) {
       wbCode = wbCode.replace(tqdTarget, tqdReplacement);
       console.log('   OK - workbench (TQd panel responsive max-h) patched');
-    } else if (wbCode.includes('max-h-[min(540px,75vh)]')) {
+    } else if (wbCode.includes(tqdOldNoHidden)) {
+      wbCode = wbCode.replace(tqdOldNoHidden, tqdReplacement);
+      console.log('   OK - workbench (TQd panel restored overflow-hidden) patched');
+    } else if (wbCode.includes('max-h-[min(540px,75vh)] overflow-hidden outline-none')) {
       console.log('   OK - workbench (TQd panel responsive max-h) already patched');
     }
 
@@ -274,6 +287,15 @@ if (fs.existsSync(wbPath)) {
       console.log('   OK - workbench (IQd visible custom scrollbar) patched');
     } else if (wbCode.includes('custom-scrollbar pr-1')) {
       console.log('   OK - workbench (IQd visible custom scrollbar) already patched');
+    }
+
+    const wbPopupTarget = 'className:"min-w-64 max-w-80 !w-max p-1",children:v(TQd,{})';
+    const wbPopupReplacement = 'className:"min-w-64 max-w-80 !w-max p-1 overflow-hidden",children:v(TQd,{})';
+    if (wbCode.includes(wbPopupTarget)) {
+      wbCode = wbCode.replace(wbPopupTarget, wbPopupReplacement);
+      console.log('   OK - workbench (bi.Content popup outer overflow-hidden) patched');
+    } else if (wbCode.includes(wbPopupReplacement)) {
+      console.log('   OK - workbench (bi.Content popup outer overflow-hidden) already patched');
     }
 
     // G. Effort label lookup (kQd)
@@ -343,6 +365,33 @@ if (fs.existsSync(wbPath)) {
       console.log('   OK - workbench (2.6.0 Models & Usage Dialog Quota) patched');
     } else if (wbCode.includes('http://127.0.0.1:50999/v1internal/quotaSummary') && wbCode.includes('g(_g)')) {
       console.log('   OK - workbench (2.6.0 Models & Usage Dialog Quota) already patched');
+    }
+
+    // J6. Models & Usage Cost Settings Card (Workbench)
+    const wbSettingsTarget = 'description:"Manage your model quota and credits.",children:[';
+    const wbCardSnippet = makeByokSettingsCardSnippet('v');
+    const oldWbCardDefRegex = /^\s*var AgyCostSettingsCard=[\s\S]*?;\n+/;
+    if (oldWbCardDefRegex.test(wbCode)) {
+      wbCode = wbCode.replace(oldWbCardDefRegex, '');
+    }
+    if (wbCode.includes('v(AgyCostSettingsCard,{})')) {
+      wbCode = wbCode.replace('v(AgyCostSettingsCard,{})', wbCardSnippet);
+      console.log('   OK - workbench (Models & Usage Cost Settings Card) updated to direct inline JSX');
+    } else if (wbCode.includes(wbSettingsTarget) && !wbCode.includes('BYOK Provider & Cost Management')) {
+      wbCode = wbCode.replace(wbSettingsTarget, wbSettingsTarget + wbCardSnippet);
+      console.log('   OK - workbench (Models & Usage Cost Settings Card) injected');
+    } else if (wbCode.includes('BYOK Provider & Cost Management')) {
+      console.log('   OK - workbench (Models & Usage Cost Settings Card) already injected');
+    }
+
+    // J7. Cascade Bar: Always show file nav section (< Edited files 1/N >)
+    const uonFileNavTarget = 'const n=i===1;this._fileNavSection.classList.toggle("hidden",n);';
+    const uonFileNavReplacement = 'const n=!1;this._fileNavSection.classList.toggle("hidden",n);';
+    if (wbCode.includes(uonFileNavTarget)) {
+      wbCode = wbCode.replace(uonFileNavTarget, uonFileNavReplacement);
+      console.log('   OK - workbench (uOn Cascade Bar file navigation always visible) patched');
+    } else if (wbCode.includes(uonFileNavReplacement)) {
+      console.log('   OK - workbench (uOn Cascade Bar file navigation) already patched');
     }
 
   } else {
@@ -438,11 +487,15 @@ if (fs.existsSync(wbPath)) {
 
     // F. POu & BOu
     const pouTarget = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-80 overflow-hidden outline-none"';
-    const pouReplacement = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-[min(540px,75vh)] outline-none"';
+    const pouOldNoHidden = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-[min(540px,75vh)] outline-none"';
+    const pouReplacement = 'POu=()=>E("div",{"data-testid":"model-selector-panel",className:"flex flex-col max-h-[min(540px,75vh)] overflow-hidden outline-none"';
     if (wbCode.includes(pouTarget)) {
       wbCode = wbCode.replace(pouTarget, pouReplacement);
       console.log('   OK - workbench (POu panel responsive max-h) patched');
-    } else if (wbCode.includes('max-h-[min(540px,75vh)]')) {
+    } else if (wbCode.includes(pouOldNoHidden)) {
+      wbCode = wbCode.replace(pouOldNoHidden, pouReplacement);
+      console.log('   OK - workbench (POu panel restored overflow-hidden) patched');
+    } else if (wbCode.includes('max-h-[min(540px,75vh)] overflow-hidden outline-none')) {
       console.log('   OK - workbench (POu panel responsive max-h) already patched');
     }
 
@@ -543,35 +596,228 @@ if (fs.existsSync(wbPath)) {
 // 1b. Patch workbench.desktop.main.css
 if (fs.existsSync(wbCssPath)) {
   let cssCode = fs.readFileSync(wbCssPath, 'utf8');
+
+  // Clean up any old scrollbar and cascade bar blocks to avoid duplicate injections
+  const scrollbarBlockRegex = /\/\* === AGY_SCROLLBAR_CSS_START ===[\s\S]*?\/\* === AGY_SCROLLBAR_CSS_END === \*\/|\/\* Antigravity BYOK Model Menu[\s\S]*?(?=(\/\* Antigravity Enhanced Cascade Bar|\/\* ===|$))/g;
+  cssCode = cssCode.replace(scrollbarBlockRegex, '');
+  const orphanedPanelRegex = /\[data-testid="model-selector-panel"\]\s*(?=\/\*|$)/g;
+  cssCode = cssCode.replace(orphanedPanelRegex, '');
+  const cascadeBlockRegex = /\/\* Antigravity Enhanced Cascade Bar[\s\S]*?$/;
+  cssCode = cssCode.replace(cascadeBlockRegex, '');
+  cssCode = cssCode.trimEnd();
+
   const scrollbarCss = `
-/* Antigravity BYOK Model Menu Scrollbar */
-.custom-scrollbar {
-  scrollbar-width: thin !important;
-  scrollbar-color: rgba(140, 140, 140, 0.4) transparent !important;
+/* === AGY_SCROLLBAR_CSS_START === */
+/* Antigravity BYOK Model Menu & Modal Clean Scrollbar */
+/* Global: eliminate stepper buttons and arrows on all WebKit scrollbars */
+*::-webkit-scrollbar-button,
+::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
+
+/* 1. COMPLETELY HIDE and DISABLE outer scrollbars */
+.scrollbar-none,
+[role="menu"],
+[data-base-ui-popup],
+[data-radix-popper-content-wrapper],
+[data-radix-popper-content-wrapper] > div,
+[data-testid="model-selector-panel"],
+[data-testid="model-selector-panel"] > div,
+#agy-settings-card,
+#agy-settings-overlay,
+#agy-modal-card,
+#agy-modal-overlay {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.scrollbar-none::-webkit-scrollbar,
+[role="menu"]::-webkit-scrollbar,
+[data-base-ui-popup]::-webkit-scrollbar,
+[data-radix-popper-content-wrapper]::-webkit-scrollbar,
+[data-radix-popper-content-wrapper] > div::-webkit-scrollbar,
+[data-testid="model-selector-panel"]::-webkit-scrollbar,
+[data-testid="model-selector-panel"] > div::-webkit-scrollbar,
+#agy-settings-card::-webkit-scrollbar,
+#agy-settings-overlay::-webkit-scrollbar,
+#agy-modal-card::-webkit-scrollbar,
+#agy-modal-overlay::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+[data-testid="model-selector-panel"] {
+  max-height: min(520px, 75vh) !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+}
+
+[data-testid="model-selector-panel"] > div:first-child {
+  overflow: hidden !important;
+  max-height: none !important;
+  display: flex !important;
+  flex-direction: column !important;
+  flex-grow: 1 !important;
+  min-height: 0 !important;
+}
+
+/* 2. INNER SCROLLBAR: Native overlay style that fades out in idle and appears smoothly on hover */
+.custom-scrollbar {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px !important;
   height: 6px !important;
-  display: block !important;
 }
+
+.custom-scrollbar::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar-track {
   background: transparent !important;
 }
-.custom-scrollbar::-webkit-scrollbar-thumb {
-  background-color: rgba(140, 140, 140, 0.4) !important;
-  border-radius: 4px !important;
+
+.custom-scrollbar::-webkit-scrollbar-corner {
+  background: transparent !important;
 }
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: transparent !important;
+  border-radius: 9999px !important;
+  transition: background-color 0.2s ease-in-out !important;
+}
+
+.custom-scrollbar:hover::-webkit-scrollbar-thumb {
+  background: rgba(140, 140, 140, 0.45) !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(160, 160, 160, 0.7) !important;
+  background: rgba(180, 180, 180, 0.75) !important;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:active {
+  background: rgba(200, 200, 200, 0.9) !important;
+}
+/* === AGY_SCROLLBAR_CSS_END === */
+
+/* Antigravity Enhanced Cascade Bar & File Nav Controls */
+.cascade-bar {
+  z-index: 100 !important;
+}
+.cascade-bar .bar-mode {
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5) !important;
+  border: 1px solid var(--vscode-commandCenter-activeBorder, rgba(255, 255, 255, 0.2)) !important;
+  background-color: var(--vscode-quickInput-background, #1f1f23) !important;
+  border-radius: 8px !important;
+  padding: 4px 8px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+}
+.cascade-bar .file-with-diff .resolve-changes {
+  gap: 8px !important;
+  padding: 2px 8px 2px 2px !important;
+  border-right: 1px solid var(--vscode-commandCenter-activeBorder, rgba(255, 255, 255, 0.15)) !important;
+  display: flex !important;
+  align-items: center !important;
+}
+.cascade-bar .file-with-diff .resolve-changes button.keep-changes {
+  padding: 5px 14px !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  border-radius: 5px !important;
+  background-color: #059669 !important;
+  color: #ffffff !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  cursor: pointer !important;
+  border: none !important;
+  transition: background-color 0.15s ease !important;
+}
+.cascade-bar .file-with-diff .resolve-changes button.keep-changes:hover {
+  background-color: #10b981 !important;
+}
+.cascade-bar .file-with-diff .resolve-changes button.discard-changes {
+  padding: 5px 12px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  border-radius: 5px !important;
+  background-color: rgba(239, 68, 68, 0.1) !important;
+  border: 1px solid rgba(239, 68, 68, 0.3) !important;
+  color: #fca5a5 !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  cursor: pointer !important;
+  transition: all 0.15s ease !important;
+}
+.cascade-bar .file-with-diff .resolve-changes button.discard-changes:hover {
+  background-color: rgba(239, 68, 68, 0.25) !important;
+  color: #ffffff !important;
+}
+.cascade-bar .file-with-diff .file-nav-section {
+  padding: 2px 8px !important;
+  gap: 6px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  border-left: 1px solid var(--vscode-commandCenter-activeBorder, rgba(255, 255, 255, 0.15)) !important;
+  display: flex !important;
+  align-items: center !important;
+}
+.cascade-bar .file-with-diff .file-nav-section.hidden {
+  display: flex !important;
+}
+.cascade-bar .file-with-diff button:is(.prev-file,.next-file) {
+  padding: 4px 6px !important;
+  border-radius: 4px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  background-color: rgba(255, 255, 255, 0.06) !important;
+  color: var(--vscode-foreground) !important;
+}
+.cascade-bar .file-with-diff button:is(.prev-file,.next-file):hover {
+  background-color: rgba(255, 255, 255, 0.15) !important;
+}
+.cascade-bar .file-with-diff .hunk-nav {
+  padding: 2px 6px !important;
+  gap: 4px !important;
+  display: flex !important;
+  align-items: center !important;
+}
+.cascade-bar .file-with-diff .hunk-nav button:is(.previous-hunk,.next-hunk) {
+  padding: 4px 6px !important;
+  border-radius: 4px !important;
+  cursor: pointer !important;
+  background-color: rgba(255, 255, 255, 0.06) !important;
+  color: var(--vscode-foreground) !important;
+}
+.cascade-bar .file-with-diff .hunk-nav button:is(.previous-hunk,.next-hunk):hover {
+  background-color: rgba(255, 255, 255, 0.15) !important;
+}
+.cascade-bar .bar-mode .shortcut {
+  font-size: 10px !important;
+  padding: 1px 5px !important;
+  background: rgba(255, 255, 255, 0.12) !important;
+  border-radius: 3px !important;
+  opacity: 0.8 !important;
+  margin-left: 4px !important;
 }
 `;
-  if (!cssCode.includes('custom-scrollbar')) {
-    cssCode += scrollbarCss;
-    fs.writeFileSync(wbCssPath, cssCode, 'utf8');
-    console.log('   OK - workbench.desktop.main.css (custom-scrollbar styles) appended');
-  } else {
-    console.log('   OK - workbench.desktop.main.css already contains custom-scrollbar styles');
-  }
+  cssCode += scrollbarCss;
+  fs.writeFileSync(wbCssPath, cssCode, 'utf8');
+  console.log('   OK - workbench.desktop.main.css (custom-scrollbar & enhanced cascade bar styles) updated');
 }
 
 // 1c. Patch out/jetskiAgent/main.js (Antigravity v2.6.0+ dedicated agent panel bundle)
@@ -760,6 +1006,125 @@ if (fs.existsSync(jetskiAgentPath)) {
     console.log('   OK - jetskiAgent (showModelUsage) already unlocked');
   }
 
+  // J3. Responsive Scrollbars on model selector and submenus
+  const kqaMaxHTarget = 'Kqa=()=>d("div",{"data-testid":fqa,className:"flex flex-col max-h-80 overflow-hidden outline-none"';
+  const kqaMaxHReplacement = 'Kqa=()=>d("div",{"data-testid":fqa,className:"flex flex-col max-h-[min(540px,75vh)] overflow-hidden outline-none"';
+  if (jsCode.includes(kqaMaxHTarget)) {
+    jsCode = jsCode.replace(kqaMaxHTarget, kqaMaxHReplacement);
+    console.log('   OK - jetskiAgent (Kqa panel responsive max-h) patched');
+  } else if (jsCode.includes('max-h-[min(540px,75vh)]')) {
+    console.log('   OK - jetskiAgent (Kqa panel responsive max-h) already patched');
+  }
+
+  const qqaScrollTarget = 'overflow-y-auto overscroll-y-none pb-1 gap-px scrollbar-none';
+  const qqaScrollReplacement = 'overflow-y-auto overscroll-y-none pb-1 gap-px custom-scrollbar pr-1';
+  if (jsCode.includes(qqaScrollTarget)) {
+    jsCode = jsCode.replace(qqaScrollTarget, qqaScrollReplacement);
+    console.log('   OK - jetskiAgent (Qqa visible custom scrollbar) patched');
+  } else if (jsCode.includes('custom-scrollbar pr-1')) {
+    console.log('   OK - jetskiAgent (Qqa visible custom scrollbar) already patched');
+  }
+
+  const rtContentTarget = 'className:"min-w-64 max-w-80 !w-max p-1",children:d(Kqa,{})';
+  const rtContentReplacement = 'className:"min-w-64 max-w-80 !w-max p-1 overflow-hidden",children:d(Kqa,{})';
+  if (jsCode.includes(rtContentTarget)) {
+    jsCode = jsCode.replace(rtContentTarget, rtContentReplacement);
+    console.log('   OK - jetskiAgent (Rt.Content popup outer overflow-hidden) patched');
+  } else if (jsCode.includes(rtContentReplacement)) {
+    console.log('   OK - jetskiAgent (Rt.Content popup outer overflow-hidden) already patched');
+  }
+
+  const reasoningSubmenuTarget = 'd(Rt.Content,{side:"right",align:"start",className:"min-w-40",children:a&&R.base==="Gemini 4 Argon"';
+  const reasoningSubmenuReplacement = 'd(Rt.Content,{side:"right",align:"start",className:"min-w-40 max-h-[min(360px,70vh)] overflow-y-auto custom-scrollbar",children:a&&R.base==="Gemini 4 Argon"';
+  if (jsCode.includes(reasoningSubmenuTarget)) {
+    jsCode = jsCode.replace(reasoningSubmenuTarget, reasoningSubmenuReplacement);
+    console.log('   OK - jetskiAgent (reasoning submenu custom scrollbar & responsive max-h) patched');
+  } else if (jsCode.includes('className:"min-w-40 max-h-[min(360px,70vh)] overflow-y-auto custom-scrollbar",children:a&&R.base==="Gemini 4 Argon"')) {
+    console.log('   OK - jetskiAgent (reasoning submenu custom scrollbar) already patched');
+  }
+
+  const contextWindowSubmenuTarget = 'd(Rt.Content,{side:"right",align:"start",className:"min-w-40",collisionBoundary:"viewport"';
+  const contextWindowSubmenuReplacement = 'd(Rt.Content,{side:"right",align:"start",className:"min-w-40 max-h-[min(360px,70vh)] overflow-y-auto custom-scrollbar",collisionBoundary:"viewport"';
+  if (jsCode.includes(contextWindowSubmenuTarget)) {
+    jsCode = jsCode.replace(contextWindowSubmenuTarget, contextWindowSubmenuReplacement);
+    console.log('   OK - jetskiAgent (context window submenu custom scrollbar & responsive max-h) patched');
+  } else if (jsCode.includes('className:"min-w-40 max-h-[min(360px,70vh)] overflow-y-auto custom-scrollbar",collisionBoundary:"viewport"')) {
+    console.log('   OK - jetskiAgent (context window submenu custom scrollbar) already patched');
+  }
+
+  // J4. Assistant Response Cost & Token Badges (LOa)
+  const agyCostBadgeDef = `
+var AgyCostBadge=({stepIndex:e,metadata:t,responseText:r})=>{let[u,s]=j(null),[c,f]=j(null);let trajId=t?.sourceTrajectoryStepInfo?.trajectoryId;ge(()=>{fetch("http://127.0.0.1:50999/v1internal/costSettings").then(x=>x.json()).then(x=>f(x)).catch(()=>{});let q="http://127.0.0.1:50999/v1internal/usage";if(trajId&&e!==void 0)q+="?conversationId="+encodeURIComponent(trajId)+"&stepIndex="+encodeURIComponent(e);else if(trajId)q+="?conversationId="+encodeURIComponent(trajId);fetch(q).then(x=>x.json()).then(x=>{if(x&&(x.promptTokens||x.totalTokens||x.costUsd!==void 0||x.provider))s(x)}).catch(()=>{})},[e,trajId]);if(!c||!u)return null;let provKey=(u.provider||"custom").toLowerCase();let ov=c.providerOverrides?.[provKey];let showBadge=(ov&&typeof ov.enabled==="boolean")?ov.enabled:(c.providers?.[provKey]!==!1&&(c.showCostBadges!==!1));if(!showBadge)return null;let showSession=(ov&&typeof ov.showSessionTotal==="boolean")?ov.showSessionTotal:(c.showSessionTotal!==!1);let isCust=u.isCustom;let provLbl=isCust?(u.provider?u.provider.toUpperCase():"CUSTOM"):"GOOGLE NATIVE";let inTok=(u.inputTokens||0).toLocaleString();let outTok=(u.outputTokens||0).toLocaleString();let costStr=isCust?(u.costUsd>0?"$"+u.costUsd.toFixed(4):"Free"):"Quota (Free)";let totStr=u.sessionTotalCostUsd>0?"$"+u.sessionTotalCostUsd.toFixed(4):"$0.0000";return d("div",{className:"mt-2 pt-1.5 border-t border-border/40 flex items-center justify-between text-[11px] text-muted-foreground select-none px-2 font-sans","data-testid":"agy-cost-badge"},[d("div",{className:"flex items-center gap-1.5 flex-wrap"},[d("span",{className:"px-1.5 py-0.5 rounded text-[10px] font-medium "+(isCust?"bg-indigo-500/15 text-indigo-400 border border-indigo-500/25":"bg-emerald-500/15 text-emerald-400 border border-emerald-500/25")},provLbl),d("span",{},inTok+" in / "+outTok+" out"),d("span",{className:"opacity-40"},"·"),d("span",{className:"font-medium text-foreground/80"},costStr)]),showSession&&d("div",{className:"text-[10px] opacity-75 font-mono"},"Total: "+totStr)])};
+`;
+  const loaTarget = 't.recitationMetadata&&r===xr.DONE&&d(yOa,{recitations:t.recitationMetadata.recitations||[]}),r===xr.DONE&&i!==void 0&&d(_Oa,{stepIndex:i})';
+  const loaReplacement = 't.recitationMetadata&&r===xr.DONE&&d(yOa,{recitations:t.recitationMetadata.recitations||[]}),r===xr.DONE&&i!==void 0&&d(_Oa,{stepIndex:i}),r===xr.DONE&&d(AgyCostBadge,{stepIndex:i,metadata:n,responseText:l})';
+
+  if (jsCode.includes(loaTarget)) {
+    if (!jsCode.includes('var AgyCostBadge=')) {
+      jsCode = agyCostBadgeDef + '\n' + jsCode;
+    }
+    jsCode = jsCode.replace(loaTarget, loaReplacement);
+    console.log('   OK - jetskiAgent (LOa assistant response cost badge) patched');
+  } else if (jsCode.includes('AgyCostBadge')) {
+    const oldBadgeRegex = /var AgyCostBadge=[\s\S]*?;\n/;
+    if (oldBadgeRegex.test(jsCode)) {
+      jsCode = jsCode.replace(oldBadgeRegex, agyCostBadgeDef.trim() + '\n');
+    }
+    console.log('   OK - jetskiAgent (LOa assistant response cost badge) refreshed with latest override logic');
+  }
+
+  // J5. Models & Usage Cost Settings Card (jetskiAgent)
+  const jsSettingsTarget = 'description:"Manage your model quota and credits.",children:[';
+  const jsCardSnippet = makeByokSettingsCardSnippet('d');
+  if (jsCode.includes(jsSettingsTarget) && !jsCode.includes('BYOK Provider & Cost Management')) {
+    jsCode = jsCode.replace(jsSettingsTarget, jsSettingsTarget + jsCardSnippet);
+    console.log('   OK - jetskiAgent (Models & Usage Cost Settings Card) injected');
+  } else if (jsCode.includes('BYOK Provider & Cost Management')) {
+    console.log('   OK - jetskiAgent (Models & Usage Cost Settings Card) already injected');
+  }
+
+  // J6. Enhanced Code Changes Widget & File Navigation Controls (o1n, s1n, t6a)
+  const o1nTarget = 'o1n=({onAcceptAll:e,onRejectAll:t})=>{let{logEvent:r}=nn(),{cascadeContext:{state:{agentStateProvider:n}}}=Br();return d("div",{className:"flex flex-row items-center gap-1",children:[d("button",{type:"button",className:"cursor-pointer select-none rounded px-1 text-sm opacity-50 hover:opacity-70 border-none bg-transparent",onClick:()=>{(async()=>{let i=n.getState(),a=oN(i),o=U5(i);r(Wt.CASCADE_CHANGES_REJECT_ALL,zt({extra:{trajectoryId:a??"",stepIndex:o?(o-1).toString():""}},"system-generated trajectory/step identifiers")),await t()})()},children:"Reject all"}),d("button",{type:"button",className:"hover:bg-secondary cursor-pointer select-none rounded bg-primary px-1 text-sm text-primary-foreground border-none",onClick:()=>{(async()=>{let i=n.getState(),a=oN(i),o=U5(i);r(Wt.CASCADE_CHANGES_ACCEPT_ALL,zt({extra:{trajectoryId:a??"",stepIndex:o?(o-1).toString():""}},"system-generated trajectory/step identifiers")),await e()})()},children:"Accept all"})]})},';
+  const o1nReplacement = 'o1n=({onAcceptAll:e,onRejectAll:t})=>{let{logEvent:r}=nn(),{cascadeContext:{state:{agentStateProvider:n}}}=Br();return d("div",{className:"flex flex-row items-center gap-1.5",children:[d("button",{type:"button",className:"cursor-pointer select-none rounded-md px-2.5 py-1 text-xs font-medium border border-border/80 text-muted-foreground hover:text-foreground hover:bg-destructive/15 hover:border-destructive/40 transition-colors",onClick:()=>{(async()=>{let i=n.getState(),a=oN(i),o=U5(i);r(Wt.CASCADE_CHANGES_REJECT_ALL,zt({extra:{trajectoryId:a??"",stepIndex:o?(o-1).toString():""}},"system-generated trajectory/step identifiers")),await t()})()},children:"Reject all"}),d("button",{type:"button",className:"cursor-pointer select-none rounded-md px-3 py-1 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm transition-all border border-emerald-500/30 flex items-center gap-1",onClick:()=>{(async()=>{let i=n.getState(),a=oN(i),o=U5(i);r(Wt.CASCADE_CHANGES_ACCEPT_ALL,zt({extra:{trajectoryId:a??"",stepIndex:o?(o-1).toString():""}},"system-generated trajectory/step identifiers")),await e()})()},children:[d(de,{name:"check",size:13}),d("span",{children:"Accept all"})]})]})},';
+  if (jsCode.includes(o1nTarget)) {
+    jsCode = jsCode.replace(o1nTarget, o1nReplacement);
+    console.log('   OK - jetskiAgent (o1n enhanced Accept all / Reject all buttons) patched');
+  } else if (jsCode.includes('bg-emerald-600 hover:bg-emerald-500')) {
+    console.log('   OK - jetskiAgent (o1n) already patched');
+  }
+
+  const s1nTarget = 's1n=({fileDiffData:e})=>{let{workspaceInfo:t,stepHandler:{openFile:r}={}}=Br(),{homeDir:n,workspaceUris:i}=t;return d("div",{className:"flex flex-col",children:e.map((a,o)=>{let{uri:s,diffType:l,numInsertions:u,numDeletions:h}=a;return d("div",{className:"flex cursor-pointer select-none flex-row items-center gap-x-2 border-border p-1 px-2 hover:bg-muted",onClick:f=>{r?.(s),f.stopPropagation(),f.preventDefault()},children:[d("div",{className:ke("flex aspect-square h-3 w-3 flex-none items-center justify-center rounded-sm border",l==="addition"?"!border-green text-green":"!border-orange text-orange"),children:l==="addition"?d(de,{name:"add",size:10}):d("span",{className:"h-1 w-1 flex-none rounded-full border !border-orange bg-orange"})}),d("div",{className:"flex flex-row items-center gap-x-1",children:[d("span",{className:"min-w-5 text-xs text-green-500",children:["+",u]}),d("span",{className:"min-w-5 text-xs text-red-500",children:["-",h]})]}),d("span",{className:"whitespace-nowrap text-sm opacity-80",children:EE(s)}),d("span",{"data-tooltip-id":`changes-overview-${o}`,className:"min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-xs opacity-50",dir:"rtl",children:[d("bdi",{children:_N(s,n,i)}),d(Yt,{id:`changes-overview-${o}`,children:d("bdi",{children:_N(s,n,i)})})]})]},o)})})};';
+  const s1nReplacement = 's1n=({fileDiffData:e,activeIndex:t,onSelectIndex:r})=>{let{workspaceInfo:n,stepHandler:{openFile:i}={}}=Br(),{homeDir:a,workspaceUris:o}=n;return d("div",{className:"flex flex-col gap-0.5",children:e.map((s,l)=>{let{uri:u,diffType:c,numInsertions:h,numDeletions:p}=s;let isAct=t===l;return d("div",{key:l,className:ke("flex cursor-pointer select-none flex-row items-center justify-between gap-x-2 rounded px-2 py-1 transition-colors text-xs hover:bg-muted/70",isAct?"bg-muted border border-border/60":"border border-transparent"),onClick:f=>{r?.(l),i?.(u),f.stopPropagation(),f.preventDefault()},children:[d("div",{className:"flex items-center gap-2 min-w-0 overflow-hidden",children:[d("div",{className:ke("flex aspect-square h-3.5 w-3.5 flex-none items-center justify-center rounded border",c==="addition"?"border-emerald-500/50 text-emerald-400 bg-emerald-500/10":"border-amber-500/50 text-amber-400 bg-amber-500/10"),children:c==="addition"?d(de,{name:"add",size:11}):d("span",{className:"h-1.5 w-1.5 flex-none rounded-full bg-amber-400"})}),d("span",{className:"whitespace-nowrap font-medium text-foreground/90 overflow-hidden text-ellipsis",children:EE(u)}),d("span",{"data-tooltip-id":`changes-overview-${l}`,className:"min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] opacity-40",dir:"rtl",children:[d("bdi",{children:_N(u,a,o)}),d(Yt,{id:`changes-overview-${l}`,children:d("bdi",{children:_N(u,a,o)})})]})]}),d("div",{className:"flex flex-row items-center gap-1.5 flex-none font-mono text-[10px]",children:[h>0&&d("span",{className:"px-1.5 py-0.2 rounded text-emerald-400 bg-emerald-500/10 border border-emerald-500/20",children:["+",h]}),p>0&&d("span",{className:"px-1.5 py-0.2 rounded text-rose-400 bg-rose-500/10 border border-rose-500/20",children:["-",p]})]})]})})})};';
+  if (jsCode.includes(s1nTarget)) {
+    jsCode = jsCode.replace(s1nTarget, s1nReplacement);
+    console.log('   OK - jetskiAgent (s1n enhanced file diff list with styled +/- badges) patched');
+  } else if (jsCode.includes('activeIndex:t,onSelectIndex:r')) {
+    console.log('   OK - jetskiAgent (s1n) already patched');
+  }
+
+  const t6aTarget = 'function t6a(){let{fileDiffData:e}=von(),t=nt().get("conversationView")?.inlineFileChangesCloseAll,[r,n]=j(!0);if(e.length===0)return null;let i=()=>(t?.(!0),Promise.resolve()),a=()=>(t?.(!1),Promise.resolve()),o=e.length,s=`${o} File${o===1?"":"s"} With Changes`;return d("div",{className:"relative flex flex-col w-full mb-2 border border-gray-500/10 bg-ide-editor-background rounded-lg",children:[r&&d("div",{className:"border-b border-border/50 max-h-48 overflow-y-auto bg-ide-editor-background p-1",children:d(s1n,{fileDiffData:e})}),d("div",{className:"flex min-h-[1.8rem] justify-between items-center px-2 py-1",children:[d("div",{className:"flex items-center gap-x-2 overflow-hidden",children:d("button",{type:"button","data-testid":"expand-button",className:"flex flex-row items-center gap-1.5 cursor-pointer select-none text-xs font-medium hover:opacity-80 overflow-hidden bg-transparent border-none p-0 focus:outline-none",onClick:()=>{n(!r)},children:[d(de,{name:"description",size:14,className:"text-muted-foreground flex-none"}),d("span",{className:"whitespace-nowrap overflow-hidden text-ellipsis",children:s}),r?d(de,{name:"keyboard_arrow_up",size:14,className:"text-muted-foreground flex-none"}):d(de,{name:"keyboard_arrow_down",size:14,className:"text-muted-foreground flex-none"})]})}),d("div",{className:"flex items-center gap-1",children:d(o1n,{onAcceptAll:i,onRejectAll:a})})]})]})}';
+  const t6aReplacement = 'function t6a(){let{fileDiffData:e}=von(),t=nt().get("conversationView")?.inlineFileChangesCloseAll,[r,n]=j(!0),[fIdx,setFIdx]=j(0);let{stepHandler:{openFile:openFn}={}}=Br();if(e.length===0)return null;let i=()=>(t?.(!0),Promise.resolve()),a=()=>(t?.(!1),Promise.resolve()),o=e.length,s=`${o} File${o===1?"":"s"} With Changes`;let navPrev=(ev)=>{ev.stopPropagation();let next=(fIdx-1+o)%o;setFIdx(next);if(e[next]?.uri)openFn?.(e[next].uri)};let navNext=(ev)=>{ev.stopPropagation();let next=(fIdx+1)%o;setFIdx(next);if(e[next]?.uri)openFn?.(e[next].uri)};return d("div",{className:"relative flex flex-col w-full mb-2.5 border border-border/80 bg-ide-editor-background rounded-lg shadow-sm overflow-hidden",children:[r&&d("div",{className:"border-b border-border/60 max-h-52 overflow-y-auto bg-ide-editor-background p-1.5",children:d(s1n,{fileDiffData:e,activeIndex:fIdx,onSelectIndex:setFIdx})}),d("div",{className:"flex min-h-[2.2rem] justify-between items-center px-2.5 py-1.5 bg-secondary/30",children:[d("div",{className:"flex items-center gap-x-2 overflow-hidden",children:[d("button",{type:"button","data-testid":"expand-button",className:"flex flex-row items-center gap-1.5 cursor-pointer select-none text-xs font-medium hover:opacity-80 overflow-hidden bg-transparent border-none p-0 focus:outline-none",onClick:()=>{n(!r)},children:[d(de,{name:"description",size:15,className:"text-muted-foreground flex-none"}),d("span",{className:"whitespace-nowrap overflow-hidden text-ellipsis font-medium",children:s}),r?d(de,{name:"keyboard_arrow_up",size:15,className:"text-muted-foreground flex-none"}):d(de,{name:"keyboard_arrow_down",size:15,className:"text-muted-foreground flex-none"})]}),o>1&&d("div",{className:"flex items-center gap-1 ml-2 pl-2 border-l border-border/60 text-xs text-muted-foreground select-none",children:[d("button",{type:"button",onClick:navPrev,className:"cursor-pointer hover:text-foreground hover:bg-secondary p-0.5 rounded transition-colors border-none bg-transparent flex items-center justify-center",title:"Arquivo anterior",children:d(de,{name:"chevron_left",size:14})}),d("span",{className:"text-[11px] font-mono px-1 font-semibold text-foreground/80"},(fIdx+1)+"/"+o),d("button",{type:"button",onClick:navNext,className:"cursor-pointer hover:text-foreground hover:bg-secondary p-0.5 rounded transition-colors border-none bg-transparent flex items-center justify-center",title:"Próximo arquivo",children:d(de,{name:"chevron_right",size:14})})]})]}),d("div",{className:"flex items-center gap-1.5",children:d(o1n,{onAcceptAll:i,onRejectAll:a})})]})]})}';
+  if (jsCode.includes(t6aTarget)) {
+    jsCode = jsCode.replace(t6aTarget, t6aReplacement);
+    console.log('   OK - jetskiAgent (t6a file diff widget with header stepper < 1/N >) patched');
+  } else if (jsCode.includes('navPrev=(ev)=>{')) {
+    if (jsCode.includes('p-1.5 custom-scrollbar')) {
+      jsCode = jsCode.replace('p-1.5 custom-scrollbar', 'p-1.5');
+      console.log('   OK - jetskiAgent (t6a cleaned up custom-scrollbar to prevent double bars)');
+    }
+    console.log('   OK - jetskiAgent (t6a) already patched');
+  }
+
+  // J6b. Unlock conversation inlineFileChangesEnabled so t6a renders
+  const inlineDiffTarget = 'l=nt().get("conversationView")?.inlineFileChangesEnabled??!1';
+  const inlineDiffReplacement = 'l=!0';
+  if (jsCode.includes(inlineDiffTarget)) {
+    jsCode = jsCode.replace(inlineDiffTarget, inlineDiffReplacement);
+    console.log('   OK - jetskiAgent (inlineFileChangesEnabled chat diff box) unlocked');
+  } else if (jsCode.includes('l=!0,u=slt(e),h=P$r')) {
+    console.log('   OK - jetskiAgent (inlineFileChangesEnabled chat diff box) already unlocked');
+  }
+
   // K. Inject modalCode.js
   const modalCodePath = path.join(__dirname, 'modalCode.js');
   if (fs.existsSync(modalCodePath)) {
@@ -782,35 +1147,121 @@ if (fs.existsSync(jetskiAgentPath)) {
 // 1d. Patch out/jetskiMain.tailwind.css
 if (fs.existsSync(jetskiCssPath)) {
   let cssCode = fs.readFileSync(jetskiCssPath, 'utf8');
+
+  // Clean up any old scrollbar blocks to avoid duplicates
+  const scrollbarBlockRegex = /\/\* === AGY_SCROLLBAR_CSS_START ===[\s\S]*?\/\* === AGY_SCROLLBAR_CSS_END === \*\/|\/\* Antigravity BYOK Model Menu[\s\S]*?(?=(\/\* ===|$))/g;
+  cssCode = cssCode.replace(scrollbarBlockRegex, '');
+  const orphanedPanelRegex = /\[data-testid="model-selector-panel"\]\s*(?=\/\*|$)/g;
+  cssCode = cssCode.replace(orphanedPanelRegex, '');
+  cssCode = cssCode.replace(/\.custom-scrollbar[^{]*\{[\s\S]*?\}\s*/g, '');
+  cssCode = cssCode.trimEnd();
+
   const scrollbarCss = `
-/* Antigravity BYOK Model Menu Scrollbar */
-.custom-scrollbar {
-  scrollbar-width: thin !important;
-  scrollbar-color: rgba(140, 140, 140, 0.4) transparent !important;
+/* === AGY_SCROLLBAR_CSS_START === */
+/* Antigravity BYOK Model Menu Scrollbar - Native Thin Overlay */
+/* Global: eliminate stepper buttons and arrows on all WebKit scrollbars */
+*::-webkit-scrollbar-button,
+::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
+
+/* 1. COMPLETELY HIDE and DISABLE outer scrollbars */
+.scrollbar-none,
+[role="menu"],
+[data-base-ui-popup],
+[data-radix-popper-content-wrapper],
+[data-radix-popper-content-wrapper] > div,
+[data-testid="model-selector-panel"],
+[data-testid="model-selector-panel"] > div,
+#agy-settings-card,
+#agy-settings-overlay,
+#agy-modal-card,
+#agy-modal-overlay {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.scrollbar-none::-webkit-scrollbar,
+[role="menu"]::-webkit-scrollbar,
+[data-base-ui-popup]::-webkit-scrollbar,
+[data-radix-popper-content-wrapper]::-webkit-scrollbar,
+[data-radix-popper-content-wrapper] > div::-webkit-scrollbar,
+[data-testid="model-selector-panel"]::-webkit-scrollbar,
+[data-testid="model-selector-panel"] > div::-webkit-scrollbar,
+#agy-settings-card::-webkit-scrollbar,
+#agy-settings-overlay::-webkit-scrollbar,
+#agy-modal-card::-webkit-scrollbar,
+#agy-modal-overlay::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+[data-testid="model-selector-panel"] {
+  max-height: min(520px, 75vh) !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+}
+
+[data-testid="model-selector-panel"] > div:first-child {
+  overflow: hidden !important;
+  max-height: none !important;
+  display: flex !important;
+  flex-direction: column !important;
+  flex-grow: 1 !important;
+  min-height: 0 !important;
+}
+
+/* 2. INNER SCROLLBAR: Native overlay style that fades out in idle and appears smoothly on hover */
+.custom-scrollbar {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px !important;
   height: 6px !important;
-  display: block !important;
 }
+
+.custom-scrollbar::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar-track {
   background: transparent !important;
 }
+
+.custom-scrollbar::-webkit-scrollbar-corner {
+  background: transparent !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background-color: rgba(140, 140, 140, 0.4) !important;
-  border-radius: 4px !important;
+  background: transparent !important;
+  border-radius: 9999px !important;
+  transition: background-color 0.2s ease-in-out !important;
 }
+
+.custom-scrollbar:hover::-webkit-scrollbar-thumb {
+  background: rgba(140, 140, 140, 0.45) !important;
+}
+
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(160, 160, 160, 0.7) !important;
+  background: rgba(180, 180, 180, 0.75) !important;
 }
+
+.custom-scrollbar::-webkit-scrollbar-thumb:active {
+  background: rgba(200, 200, 200, 0.9) !important;
+}
+/* === AGY_SCROLLBAR_CSS_END === */
 `;
-  if (!cssCode.includes('custom-scrollbar')) {
-    cssCode += scrollbarCss;
-    fs.writeFileSync(jetskiCssPath, cssCode, 'utf8');
-    console.log('   OK - jetskiMain.tailwind.css (custom-scrollbar styles) appended');
-  } else {
-    console.log('   OK - jetskiMain.tailwind.css already contains custom-scrollbar styles');
-  }
+  cssCode += '\n' + scrollbarCss + '\n';
+  fs.writeFileSync(jetskiCssPath, cssCode, 'utf8');
+  console.log('   OK - jetskiMain.tailwind.css (custom-scrollbar styles) updated');
 }
 
 // 2. Patch out/main.js
@@ -838,6 +1289,23 @@ if (fs.existsSync(mainPath)) {
   } else if (r2lTargetRegex.test(mainCode)) {
     mainCode = mainCode.replace(r2lTargetRegex, `function r2l(e){${customModelsInjector}const t=e.models,r=new Set;`);
     console.log('   OK - main.js r2l (v2.5.5) hook injected');
+  }
+
+  // Models & Usage Cost Settings Card (main.js)
+  const mainSettingsTarget = 'description:"Manage your model quota and credits.",children:[';
+  const mainCardSnippet = makeByokSettingsCardSnippet('h');
+  const oldMainCardDefRegex = /^\s*var AgyCostSettingsCard=[\s\S]*?;\n+/;
+  if (oldMainCardDefRegex.test(mainCode)) {
+    mainCode = mainCode.replace(oldMainCardDefRegex, '');
+  }
+  if (mainCode.includes('h(AgyCostSettingsCard,{})')) {
+    mainCode = mainCode.replace('h(AgyCostSettingsCard,{})', mainCardSnippet);
+    console.log('   OK - main.js (Models & Usage Cost Settings Card) updated to direct inline JSX');
+  } else if (mainCode.includes(mainSettingsTarget) && !mainCode.includes('BYOK Provider & Cost Management')) {
+    mainCode = mainCode.replace(mainSettingsTarget, mainSettingsTarget + mainCardSnippet);
+    console.log('   OK - main.js (Models & Usage Cost Settings Card) injected');
+  } else if (mainCode.includes('BYOK Provider & Cost Management')) {
+    console.log('   OK - main.js (Models & Usage Cost Settings Card) already injected');
   }
 
   // LS args (2.5.5 legacy)
@@ -936,6 +1404,46 @@ if (fs.existsSync(extJsPath)) {
   if (extModified) {
     fs.writeFileSync(extJsPath, extCode, 'utf8');
     console.log('   OK - extension.js saved successfully');
+  }
+}
+
+// 2.6 Patch v2.6.0+ built-in agy extension (extensions/agy/vscode/extension.js)
+const agyExtJsPath = path.join(appDir, 'extensions', 'agy', 'vscode', 'extension.js');
+if (fs.existsSync(agyExtJsPath)) {
+  let agyExtCode = fs.readFileSync(agyExtJsPath, 'utf8');
+  let agyExtModified = false;
+
+  const agySpawnTarget = 'let d=["--hub",`--hub-port=${a.targetPort}`,"--app_data_dir=antigravity",`--csrf_token=${this.csrfToken}`,...a.baseExtraArgs],g=`http://127.0.0.1:${a.targetPort}`,h;';
+  const agySpawnReplacement = 'let _byokHubPort=a.targetPort,_byokProxySrv=null;try{a.serverEnv=Object.assign({},a.serverEnv,{CLOUD_CODE_URL:"http://127.0.0.1:50999"});const _hi=require("path").join(__dirname,"..","..","..","out","mrmppro-proxy","hubInterceptor.js");if(require("fs").existsSync(_hi)){const _rp=await this.getAvailableEphemeralPort();_byokProxySrv=await require(_hi).startHubInterceptor(a.targetPort,_rp,this.csrfToken);if(_byokProxySrv)_byokHubPort=_rp}}catch(_e){console.error("[BYOK Hub Interceptor] Error:",_e)}let d=["--hub",`--hub-port=${_byokHubPort}`,"--app_data_dir=antigravity",`--csrf_token=${this.csrfToken}`,...a.baseExtraArgs],g=`http://127.0.0.1:${a.targetPort}`,h;';
+  if (agyExtCode.includes(agySpawnTarget)) {
+    agyExtCode = agyExtCode.replace(agySpawnTarget, agySpawnReplacement);
+    agyExtModified = true;
+    console.log('   OK - extensions/agy/vscode/extension.js (spawnAndWaitForPort) patched with BYOK Hub Interceptor & CLOUD_CODE_URL');
+  } else if (agyExtCode.includes('startHubInterceptor')) {
+    const oldCallPattern = 'const _rp=b(await c(this.getAvailableEphemeralPort()));_byokProxySrv=b(await c(require(_hi).startHubInterceptor(a.targetPort,_rp,this.csrfToken)));';
+    const newCallPattern = 'const _rp=await this.getAvailableEphemeralPort();_byokProxySrv=await require(_hi).startHubInterceptor(a.targetPort,_rp,this.csrfToken);';
+    if (agyExtCode.includes(oldCallPattern)) {
+      agyExtCode = agyExtCode.replace(oldCallPattern, newCallPattern);
+      agyExtModified = true;
+      console.log('   OK - extensions/agy/vscode/extension.js (spawnAndWaitForPort) upgraded to native await');
+    } else {
+      console.log('   OK - extensions/agy/vscode/extension.js (spawnAndWaitForPort) already patched');
+    }
+  }
+
+  const agyExitTarget = 'this.serverProcess=x;this.attachServerProcessStreams(x,p);';
+  const agyExitReplacement = 'this.serverProcess=x;if(_byokProxySrv){x.on("exit",()=>{try{_byokProxySrv.close()}catch(_){}})}this.attachServerProcessStreams(x,p);';
+  if (agyExtCode.includes(agyExitTarget)) {
+    agyExtCode = agyExtCode.replace(agyExitTarget, agyExitReplacement);
+    agyExtModified = true;
+    console.log('   OK - extensions/agy/vscode/extension.js (serverProcess exit cleanup) patched');
+  } else if (agyExtCode.includes('_byokProxySrv.close()')) {
+    console.log('   OK - extensions/agy/vscode/extension.js (serverProcess exit cleanup) already patched');
+  }
+
+  if (agyExtModified) {
+    fs.writeFileSync(agyExtJsPath, agyExtCode, 'utf8');
+    console.log('   OK - extensions/agy/vscode/extension.js saved successfully');
   }
 }
 

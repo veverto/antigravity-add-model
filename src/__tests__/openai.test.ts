@@ -32,7 +32,8 @@ describe('mapGeminiToOpenAI', () => {
       contents: [],
     };
     const result = mapGeminiToOpenAI(body, 'gpt-4o');
-    expect(result.messages[0]).toEqual({ role: 'system', content: 'You are helpful.' });
+    expect(result.messages[0].role).toBe('system');
+    expect(result.messages[0].content).toContain('You are helpful.');
   });
 
   it('should convert user messages correctly', () => {
@@ -505,11 +506,9 @@ grep "invoke_subagent" logs/transcript.jsonl
     expect(payload.messages[0].role).toBe('system');
     expect(Array.isArray(payload.messages[0].content)).toBe(true);
     const contentBlocks = payload.messages[0].content as any[];
-    expect(contentBlocks[0]).toEqual({
-      type: 'text',
-      text: 'You are an advanced agentic assistant.',
-      cache_control: { type: 'ephemeral' },
-    });
+    expect(contentBlocks[0].type).toBe('text');
+    expect(contentBlocks[0].text).toContain('You are an advanced agentic assistant.');
+    expect(contentBlocks[0].cache_control).toEqual({ type: 'ephemeral' });
   });
 
   it('pruneChatMessages preserves 100% of messages when within model token budget (Zero Pruning)', () => {
@@ -545,7 +544,7 @@ grep "invoke_subagent" logs/transcript.jsonl
       geminiBody as any,
       'google/gemini-3.8-flash',
       'medium',
-      { maxTokens: 1_048_576, maxOutputTokens: 8192 },
+      { maxTokens: 1_048_576, maxOutputTokens: 8192, workingContextBudget: 40_000 },
     );
     expect(payload.messages.length).toBe(4);
   });
@@ -585,7 +584,7 @@ grep "invoke_subagent" logs/transcript.jsonl
       geminiBody as any,
       'google/gemini-3.8-flash',
       'medium',
-      { maxTokens: 1_048_576, maxOutputTokens: 8192 },
+      { maxTokens: 1_048_576, maxOutputTokens: 8192, workingContextBudget: 40_000 },
     );
 
     // System prompt has cache_control (Breakpoint 1)
@@ -615,7 +614,7 @@ grep "invoke_subagent" logs/transcript.jsonl
       geminiBody as any,
       'google/gemini-3.8-flash',
       'medium',
-      { maxTokens: 1_048_576, maxOutputTokens: 8192 },
+      { maxTokens: 1_048_576, maxOutputTokens: 8192, workingContextBudget: 40_000 },
     );
 
     // Total messages pruned to fit workingContextBudget (40k tokens), not sending all 160+ raw turns

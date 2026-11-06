@@ -414,7 +414,8 @@ export function pruneChatMessages(
     pruned.push(firstUserMsg);
     pruned.push({
       role: 'user',
-      content: '[Note: Earlier intermediate conversation turns have been condensed to preserve context budget.]',
+      content:
+        '[Note: Earlier intermediate conversation turns have been condensed. The current active request and task are defined in the recent messages below.]',
     });
   }
   pruned.push(...prunedOlder, ...activeTurnMsgs);
@@ -511,7 +512,11 @@ export function mapGeminiToOpenAI(
 
   if (geminiBody.systemInstruction && geminiBody.systemInstruction.parts) {
     const rawSystemText = geminiBody.systemInstruction.parts.map((p) => p.text || '').join('');
-    const systemText = cleanSystemInstruction(rawSystemText);
+    const baseSystemText = cleanSystemInstruction(rawSystemText);
+    const systemText = baseSystemText
+      ? baseSystemText +
+        '\n\n<execution_guidelines>\n- When the user sends an approval or confirmation (e.g. "Pode aplicar", "Pode alterar", "prossiga", "aplique"), focus directly on executing the plan, proposal, or file modifications agreed upon in the immediately preceding messages of this active topic.\n- Do not re-evaluate or reopen completed historical tasks from earlier in the conversation.\n- Prefer direct structured tools (read_file, edit_file, write_file) rather than running shell commands (like cat, sed, awk) to inspect or modify code.\n</execution_guidelines>'
+      : '';
     if (systemText) {
       const isCacheSupported = /openrouter|anthropic|claude|gemini|deepseek|qwen/i.test(modelName);
       if (isCacheSupported) {
@@ -681,7 +686,9 @@ export function mapGeminiToOpenAI(
     16384,
   );
   const modelMaxTokens = tokenConfig?.maxTokens && tokenConfig.maxTokens > 0 ? tokenConfig.maxTokens : 128_000;
-  const workingBudget = tokenConfig?.workingContextBudget ?? DEFAULT_WORKING_CONTEXT_BUDGET;
+  const workingBudget = tokenConfig?.workingContextBudget && tokenConfig.workingContextBudget > 0
+    ? tokenConfig.workingContextBudget
+    : modelMaxTokens;
   const contextBudget = Math.min(modelMaxTokens, workingBudget);
   const finalMessages = pruneChatMessages(messages, contextBudget, maxTokens);
 
@@ -968,7 +975,10 @@ export function mapOpenAIChunkToGemini(chunk: OpenAIResponse, modelName: string)
     }
     const mappedFinishReason = finishReason === 'length' ? 'MAX_TOKENS' : 'STOP';
     activeStreamContexts.delete(streamId);
-    return { content: { parts: text ? [{ text }] : [], role: 'model' }, finishReason: mappedFinishReason, index: 0 };
+    if (!text) {
+      return null;
+    }
+    return { content: { parts: [{ text }], role: 'model' }, finishReason: mappedFinishReason, index: 0 };
   }
 
   // Only emit tool calls when finishReason signals completion (args are fully accumulated)

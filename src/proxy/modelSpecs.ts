@@ -1,11 +1,17 @@
 import log from 'electron-log';
-import { ModelSpec, ProviderModelItem } from './types';
+import { ModelPricing, ModelSpec, ProviderModelItem } from './types';
 
 // Cache em memória dos modelos públicos do OpenRouter
-interface OpenRouterPublicModel {
+export interface OpenRouterPublicModel {
   id: string;
   name: string;
   context_length?: number;
+  pricing?: {
+    prompt?: string;
+    completion?: string;
+    request?: string;
+    image?: string;
+  };
   top_provider?: {
     max_completion_tokens?: number;
   };
@@ -58,8 +64,60 @@ export async function fetchOpenRouterPublicModels(): Promise<OpenRouterPublicMod
  * Normaliza o ID do modelo para comparação flexível.
  * Ex: "openai/gpt-4o" -> "gpt-4o", "meta-llama/llama-3.3-70b-instruct" -> "llama-3.3-70b-instruct"
  */
-function normalizeModelId(id: string): string {
-  return id.toLowerCase().replace(/^(openai|anthropic|google|meta-llama|deepseek|mistralai|qwen)\//, '').trim();
+export function normalizeModelId(id: string): string {
+  return id.toLowerCase().replace(/^[a-z0-9_-]+\//, '').trim();
+}
+
+/**
+ * Permite definir o cache de modelos do OpenRouter em testes unitários.
+ */
+export function setCachedOpenRouterModelsForTesting(models: OpenRouterPublicModel[] | null): void {
+  cachedOpenRouterModels = models;
+  lastOpenRouterFetchTime = models ? Date.now() : 0;
+}
+
+/**
+ * Busca o preço de um modelo no catálogo em memória do OpenRouter (Nível 2 da hierarquia).
+ * Os preços da API pública do OpenRouter vêm como USD por token (strings) e são convertidos
+ * para USD por 1 Milhão de tokens.
+ */
+export function findDynamicModelPricing(modelName: string): ModelPricing | null {
+  if (!cachedOpenRouterModels || cachedOpenRouterModels.length === 0 || !modelName) {
+    return null;
+  }
+
+  const cleanId = normalizeModelId(modelName);
+  const mLower = modelName.toLowerCase();
+
+  const matched = cachedOpenRouterModels.find((m) => {
+    const mIdLower = m.id.toLowerCase();
+    return (
+      mIdLower === mLower ||
+      mIdLower === cleanId ||
+      mIdLower.endsWith('/' + cleanId) ||
+      normalizeModelId(m.id) === cleanId
+    );
+  });
+
+  if (
+    matched &&
+    matched.pricing &&
+    (matched.pricing.prompt !== undefined || matched.pricing.completion !== undefined)
+  ) {
+    const promptStr = matched.pricing.prompt || '0';
+    const completionStr = matched.pricing.completion || '0';
+    const promptPerToken = parseFloat(promptStr);
+    const completionPerToken = parseFloat(completionStr);
+
+    if (!isNaN(promptPerToken) && !isNaN(completionPerToken)) {
+      return {
+        inputPerMillion: Number((promptPerToken * 1_000_000).toFixed(6)),
+        outputPerMillion: Number((completionPerToken * 1_000_000).toFixed(6)),
+      };
+    }
+  }
+
+  return null;
 }
 
 /**

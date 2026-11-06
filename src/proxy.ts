@@ -29,7 +29,9 @@ import { getAutoSwitchConfigPath, loadAutoSwitchPolicy } from './autoSwitch/conf
 import { hasProtectedText, resolveFallbackRoutes, resolveRoute } from './autoSwitch/router';
 import type { AutoSwitchRoute, RequestFeatures, RouteDecision } from './autoSwitch/types';
 import { fetchProviderQuota, fetchProviderModelsList } from './proxy/adapters';
-import { resolveModelSpec } from './proxy/modelSpecs';
+import { resolveModelSpec, fetchOpenRouterPublicModels } from './proxy/modelSpecs';
+import { usageTracker } from './proxy/usageTracker';
+import { estimateTokens } from './proxy/pricing';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -672,6 +674,82 @@ function sanitizePayloadForGoogle(body: Buffer): Buffer {
   return body;
 }
 
+let lastActiveConversationId: string | undefined;
+
+function extractTrackingInfo(
+  reqJson?: Record<string, unknown>,
+  req?: http.IncomingMessage,
+  geminiBody?: GeminiRequestBody,
+): { conversationId?: string; stepIndex?: number } {
+  let conversationId: string | undefined;
+  let stepIndex: number | undefined;
+
+  if (req?.url) {
+    try {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      const qC = u.searchParams.get('conversationId') || u.searchParams.get('trajectoryId');
+      if (qC) conversationId = qC;
+      const qS = u.searchParams.get('stepIndex');
+      if (qS !== null) {
+        const parsedS = parseInt(qS, 10);
+        if (!isNaN(parsedS)) stepIndex = parsedS;
+      }
+    } catch (_) {}
+  }
+
+  if (req?.headers) {
+    const h = req.headers;
+    const hConvo = (h['x-conversation-id'] || h['x-trajectory-id'] || h['x-session-id']) as string | undefined;
+    if (hConvo && !conversationId) conversationId = hConvo;
+  }
+
+  const candidateObjs = [
+    reqJson,
+    reqJson?.request as Record<string, unknown> | undefined,
+    geminiBody as Record<string, unknown> | undefined,
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const obj of candidateObjs) {
+    const meta = (obj.metadata || obj.meta) as Record<string, unknown> | undefined;
+    const trajInfo = (meta?.sourceTrajectoryStepInfo || (meta as Record<string, unknown> | undefined)?.source_trajectory_step_info) as Record<string, unknown> | undefined;
+
+    if (!conversationId) {
+      const c =
+        (trajInfo?.trajectoryId as string) ||
+        (trajInfo?.trajectory_id as string) ||
+        (meta?.trajectoryId as string) ||
+        (meta?.trajectory_id as string) ||
+        (meta?.conversationId as string) ||
+        (meta?.conversation_id as string) ||
+        (meta?.sessionId as string) ||
+        (meta?.session_id as string) ||
+        (obj.trajectoryId as string) ||
+        (obj.conversationId as string) ||
+        (obj.sessionId as string);
+      if (typeof c === 'string' && c.trim()) {
+        conversationId = c.trim();
+      }
+    }
+
+    if (stepIndex === undefined) {
+      const s =
+        trajInfo?.stepIndex ??
+        trajInfo?.step_index ??
+        meta?.stepIndex ??
+        meta?.step_index ??
+        obj.stepIndex;
+      if (typeof s === 'number') {
+        stepIndex = s;
+      } else if (typeof s === 'string') {
+        const parsed = parseInt(s, 10);
+        if (!isNaN(parsed)) stepIndex = parsed;
+      }
+    }
+  }
+
+  return { conversationId, stepIndex };
+}
+
 // ─── Google Proxy ─────────────────────────────────────────────────────────
 
 function proxyToGoogle(req: http.IncomingMessage, res: http.ServerResponse, reqBody: Buffer): void {
@@ -767,9 +845,45 @@ function proxyToGoogle(req: http.IncomingMessage, res: http.ServerResponse, reqB
       });
     } else {
       res.writeHead(proxyRes.statusCode || 200, proxyRes.headers as Record<string, string>);
-      proxyRes.on('data', () => {
-        proxyReq.setTimeout(timeoutMs); // Keep-alive on streaming data
-      });
+      if (isGeneration) {
+        let googlePromptTokens = 0;
+        let googleOutputTokens = 0;
+        proxyRes.on('data', (chunk: Buffer) => {
+          proxyReq.setTimeout(timeoutMs); // Keep-alive on streaming data
+          try {
+            const chunkStr = chunk.toString('utf-8');
+            if (chunkStr.includes('usageMetadata')) {
+              const pMatch = chunkStr.match(/"promptTokenCount":\s*(\d+)/);
+              const cMatch = chunkStr.match(/"candidatesTokenCount":\s*(\d+)/);
+              if (pMatch) googlePromptTokens = parseInt(pMatch[1], 10);
+              if (cMatch) googleOutputTokens = parseInt(cMatch[1], 10);
+            }
+          } catch (_) {}
+        });
+        proxyRes.on('end', () => {
+          if (googlePromptTokens > 0 || googleOutputTokens > 0) {
+            let trackingInfo: { conversationId?: string; stepIndex?: number } = {};
+            try {
+              const reqJson = JSON.parse(reqBody.toString('utf-8'));
+              trackingInfo = extractTrackingInfo(reqJson, req);
+            } catch (_) {}
+            usageTracker.recordUsage({
+              conversationId: trackingInfo.conversationId || lastActiveConversationId,
+              stepIndex: trackingInfo.stepIndex,
+              provider: 'google',
+              model: 'Google Native',
+              isCustom: false,
+              inputTokens: googlePromptTokens,
+              outputTokens: googleOutputTokens,
+              explicitCost: 0,
+            });
+          }
+        });
+      } else {
+        proxyRes.on('data', () => {
+          proxyReq.setTimeout(timeoutMs); // Keep-alive on streaming data
+        });
+      }
       proxyRes.pipe(res);
     }
   });
@@ -907,7 +1021,10 @@ function handleCustomModelRequest(
    * is already streaming.
    */
   fallbacks: readonly CustomModel[] = [],
+  trackingInfo?: { conversationId?: string; stepIndex?: number },
 ): void {
+  const effectiveConversationId = trackingInfo?.conversationId || lastActiveConversationId;
+
   // P3-18: Configurable max retries per model (default 3, min 0, max 5)
   const MAX_RETRIES = Math.min(Math.max(model.maxRetries ?? 3, 0), 5);
   const REQUEST_TIMEOUT_MS = model.timeout || 120_000;
@@ -920,7 +1037,7 @@ function handleCustomModelRequest(
     if (res.headersSent || fallbacks.length === 0) return false;
     const [next, ...rest] = fallbacks;
     log.warn(`[Auto Switch] ${model.name} failed before responding (${reason}); trying ${next.name}.`);
-    handleCustomModelRequest(res, next, geminiBody, isStream, 0, rest);
+    handleCustomModelRequest(res, next, geminiBody, isStream, 0, rest, trackingInfo);
     return true;
   };
 
@@ -951,6 +1068,9 @@ function handleCustomModelRequest(
 
   if (isStream && registry.supportsStreaming(provider)) {
     (payload as Record<string, unknown>).stream = true;
+    if (provider === 'openai' || model.provider === 'openrouter') {
+      (payload as Record<string, unknown>).stream_options = { include_usage: true };
+    }
   }
 
   let finalUrlStr = model.apiUrl;
@@ -1041,7 +1161,7 @@ function handleCustomModelRequest(
                 `[Proxy] In-flight hold (${reason || limitSource}) for ${model.name}. Stepping down maxOutputTokens to ${nextTokens} and waiting ${delay}ms before retry (${retryCount + 1}/${MAX_RETRIES})...`,
               );
               setTimeout(
-                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo),
                 delay,
               );
               return;
@@ -1078,7 +1198,7 @@ function handleCustomModelRequest(
               if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
               geminiBody.generationConfig.maxOutputTokens = nextTokens;
               setTimeout(
-                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+                () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo),
                 1000,
               );
               return;
@@ -1096,7 +1216,7 @@ function handleCustomModelRequest(
           if (retryCount < MAX_RETRIES && apiRes.statusCode !== 401 && apiRes.statusCode !== 403 && apiRes.statusCode !== 404) {
             log.warn(`[Proxy] Stream error, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
             setTimeout(
-              () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+              () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo),
               1000 * (retryCount + 1),
             );
             return;
@@ -1116,6 +1236,10 @@ function handleCustomModelRequest(
       });
 
       let buffer = '';
+      let promptTokens = estimateTokens(JSON.stringify(geminiBody.contents || []));
+      let completionTokens = 0;
+      let explicitCost: number | undefined;
+      let accumulatedOutput = '';
       apiRes.on('data', (chunk: Buffer) => {
         buffer += chunk.toString('utf-8');
         const lines = buffer.split('\n');
@@ -1129,15 +1253,37 @@ function handleCustomModelRequest(
             if (dataStr === '[DONE]') continue;
             try {
               const parsed = JSON.parse(dataStr);
+              if (parsed && typeof parsed === 'object') {
+                const pObj = parsed as Record<string, unknown>;
+                const u = (pObj.usage || (pObj.message as Record<string, unknown> | undefined)?.usage) as Record<string, unknown> | undefined;
+                if (u) {
+                  if (typeof u.prompt_tokens === 'number') promptTokens = u.prompt_tokens;
+                  if (typeof u.input_tokens === 'number') promptTokens = u.input_tokens;
+                  if (typeof u.completion_tokens === 'number') completionTokens = u.completion_tokens;
+                  if (typeof u.output_tokens === 'number') completionTokens = u.output_tokens;
+                  if (typeof u.cost === 'number') explicitCost = u.cost;
+                }
+                const ch = pObj.choices as Array<Record<string, unknown>> | undefined;
+                const d = ch?.[0]?.delta as Record<string, unknown> | undefined;
+                if (typeof d?.content === 'string') accumulatedOutput += d.content;
+                if (d?.tool_calls) accumulatedOutput += JSON.stringify(d.tool_calls);
+                if (typeof (d as Record<string, unknown>)?.reasoning_content === 'string') {
+                  accumulatedOutput += (d as Record<string, unknown>).reasoning_content as string;
+                }
+              }
               const mapped = registry.translateStreamChunk(provider, parsed, model.name);
 
               if (mapped) {
-                const cloudCodeResponse = {
-                  response: { candidates: [mapped] },
-                  traceId: '',
-                  metadata: {},
-                };
-                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
+                const m = mapped as Record<string, unknown>;
+                const content = m.content as Record<string, unknown> | undefined;
+                if (!content || !Array.isArray(content.parts) || content.parts.length > 0) {
+                  const cloudCodeResponse = {
+                    response: { candidates: [mapped] },
+                    traceId: '',
+                    metadata: {},
+                  };
+                  res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
+                }
               }
             } catch (err) {
               // Partial/invalid JSON chunks are normal during streaming; debug-level only
@@ -1155,18 +1301,38 @@ function handleCustomModelRequest(
               const parsed = JSON.parse(dataStr);
               const mapped = registry.translateStreamChunk(provider, parsed, model.name);
               if (mapped) {
-                const cloudCodeResponse = {
-                  response: { candidates: [mapped] },
-                  traceId: '',
-                  metadata: {},
-                };
-                res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
+                const m = mapped as Record<string, unknown>;
+                const content = m.content as Record<string, unknown> | undefined;
+                if (!content || !Array.isArray(content.parts) || content.parts.length > 0) {
+                  const cloudCodeResponse = {
+                    response: { candidates: [mapped] },
+                    traceId: '',
+                    metadata: {},
+                  };
+                  res.write(`data: ${JSON.stringify(cloudCodeResponse)}\n\n`);
+                }
               }
             } catch (e) {
               log.debug(`[Proxy] Stream buffer drain parse warning for ${model.name}:`, (e as Error).message);
             }
           }
         }
+
+        if (completionTokens === 0 && accumulatedOutput.length > 0) {
+          completionTokens = estimateTokens(accumulatedOutput);
+        }
+        try {
+          usageTracker.recordUsage({
+            conversationId: effectiveConversationId,
+            stepIndex: trackingInfo?.stepIndex,
+            provider: model.provider || 'custom',
+            model: model.externalModelName || model.name,
+            isCustom: true,
+            inputTokens: promptTokens,
+            outputTokens: completionTokens,
+            explicitCost,
+          });
+        } catch (_) {}
 
         const finalChunk = {
           response: {
@@ -1195,7 +1361,7 @@ function handleCustomModelRequest(
           log.warn(
             `[Proxy] Server error ${apiRes.statusCode} for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`,
           );
-          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), delay);
+          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo), delay);
           return;
         }
 
@@ -1206,7 +1372,7 @@ function handleCustomModelRequest(
           log.warn(
             `[Proxy] Rate limited (429) for ${model.name}, retrying in ${delay}ms (${retryCount + 1}/${MAX_RETRIES})...`,
           );
-          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), delay);
+          setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo), delay);
           return;
         }
 
@@ -1250,7 +1416,7 @@ function handleCustomModelRequest(
               log.info(
                 `[Proxy] In-flight hold (${reason || limitSource}) for ${model.name}. Stepping down maxOutputTokens to ${nextTokens} and waiting ${delay}ms before retry (${retryCount + 1}/${MAX_RETRIES})...`,
               );
-              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), delay);
+              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo), delay);
               return;
             }
 
@@ -1284,7 +1450,7 @@ function handleCustomModelRequest(
               );
               if (!geminiBody.generationConfig) geminiBody.generationConfig = {};
               geminiBody.generationConfig.maxOutputTokens = nextTokens;
-              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks), 1000);
+              setTimeout(() => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo), 1000);
               return;
             }
 
@@ -1326,6 +1492,30 @@ function handleCustomModelRequest(
             metadata: {},
           };
 
+          try {
+            let inTok = estimateTokens(JSON.stringify(geminiBody.contents || []));
+            let outTok = estimateTokens(body);
+            let cost: number | undefined;
+            if (parsed && typeof parsed === 'object') {
+              const u = parsed.usage as Record<string, unknown> | undefined;
+              if (u) {
+                if (typeof u.prompt_tokens === 'number') inTok = u.prompt_tokens;
+                if (typeof u.completion_tokens === 'number') outTok = u.completion_tokens;
+                if (typeof u.cost === 'number') cost = u.cost;
+              }
+            }
+            usageTracker.recordUsage({
+              conversationId: effectiveConversationId,
+              stepIndex: trackingInfo?.stepIndex,
+              provider: model.provider || 'custom',
+              model: model.externalModelName || model.name,
+              isCustom: true,
+              inputTokens: inTok,
+              outputTokens: outTok,
+              explicitCost: cost,
+            });
+          } catch (_) {}
+
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(cloudCodeResponse));
         } catch (e) {
@@ -1334,7 +1524,7 @@ function handleCustomModelRequest(
           if (retryCount < MAX_RETRIES) {
             log.warn(`[Proxy] Parse error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
             setTimeout(
-              () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+              () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo),
               1000 * (retryCount + 1),
             );
             return;
@@ -1359,7 +1549,7 @@ function handleCustomModelRequest(
     if (retryCount < MAX_RETRIES) {
       log.warn(`[Proxy] Network error for ${model.name}, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
       setTimeout(
-        () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks),
+        () => handleCustomModelRequest(res, model, geminiBody, isStream, retryCount + 1, fallbacks, trackingInfo),
         1000 * (retryCount + 1),
       );
       return;
@@ -1988,6 +2178,49 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
 
+  // Cost settings endpoint for frontend UI sync
+  if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/costSettings') || req.url.startsWith('/costSettings'))) {
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end(JSON.stringify(usageTracker.getSettings()));
+    return;
+  }
+
+  // Token & Cost usage query endpoint
+  if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/usage') || req.url.startsWith('/usage'))) {
+    const parsedUrl = new URL(req.url, 'http://127.0.0.1');
+    const conversationId = parsedUrl.searchParams.get('conversationId') || undefined;
+    if (conversationId) {
+      lastActiveConversationId = conversationId;
+    }
+    const stepIndexParam = parsedUrl.searchParams.get('stepIndex');
+    const stepIndex = stepIndexParam !== null ? parseInt(stepIndexParam, 10) : undefined;
+
+    let result: unknown = null;
+    if (conversationId && stepIndex !== undefined && !isNaN(stepIndex)) {
+      result = usageTracker.getStepUsage(conversationId, stepIndex);
+    }
+    if (!result && conversationId) {
+      result = usageTracker.getLastUsage(conversationId);
+    }
+    if (!result && !conversationId) {
+      result = usageTracker.getLastUsage();
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    });
+    res.end(JSON.stringify(result || {}));
+    return;
+  }
+
   // Custom models endpoint for frontend UI sync
   if (req.method === 'GET' && req.url && (req.url.startsWith('/v1internal/customModels') || req.url.startsWith('/custom_models'))) {
     const customModels = loadCustomModels();
@@ -2269,6 +2502,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       return;
     }
 
+
     // Endpoint para salvar modelo customizado
     if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/saveCustomModel')) {
       (async () => {
@@ -2361,6 +2595,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       return;
     }
 
+
     // Endpoint para excluir modelo customizado
     if (req.method === 'POST' && req.url && req.url.startsWith('/v1internal/deleteCustomModel')) {
       try {
@@ -2422,6 +2657,57 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           res.end(JSON.stringify({ success: false, error: (err as Error).message }));
         }
       })();
+      return;
+    }
+
+    // Cost settings endpoint (POST)
+    if (req.method === 'POST' && req.url && (req.url.startsWith('/v1internal/costSettings') || req.url.startsWith('/costSettings'))) {
+      try {
+        const bodyObj = JSON.parse(bodyStr || '{}');
+        const updated = usageTracker.saveSettings(bodyObj);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ success: true, settings: updated }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    // Manual / client track usage endpoint (POST)
+    if (req.method === 'POST' && req.url && (req.url.startsWith('/v1internal/trackUsage') || req.url.startsWith('/trackUsage'))) {
+      try {
+        const payload = JSON.parse(bodyStr || '{}');
+        const record = usageTracker.recordUsage(payload);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        });
+        res.end(JSON.stringify({ success: true, record }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ success: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    // Reset usage history endpoint (POST)
+    if (req.method === 'POST' && req.url && (req.url.startsWith('/v1internal/resetUsage') || req.url.startsWith('/resetUsage'))) {
+      usageTracker.clearHistory();
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': '*',
+      });
+      res.end(JSON.stringify({ success: true, message: 'Usage history cleared' }));
       return;
     }
 
@@ -2833,6 +3119,10 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     if (req.method === 'POST' && isCloudCodeStream) {
       try {
         const reqJson = JSON.parse(bodyStr) as Record<string, unknown>;
+        const trackingInfo = extractTrackingInfo(reqJson, req);
+        if (trackingInfo.conversationId) {
+          lastActiveConversationId = trackingInfo.conversationId;
+        }
         const modelName = reqJson.model as string | undefined;
         const modelId = (reqJson.modelId || reqJson.model_id) as string | undefined;
         log.info(
@@ -2843,7 +3133,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         if (autoSelection) {
           const isStream = req.url!.includes('streamGenerateContent') || req.url!.includes('alt=sse');
           void resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() =>
-            handleCustomModelRequest(res, autoSelection.model, actualGeminiBody, isStream, 0, autoSelection.fallbacks),
+            handleCustomModelRequest(res, autoSelection.model, actualGeminiBody, isStream, 0, autoSelection.fallbacks, trackingInfo),
           );
           return;
         }
@@ -2894,7 +3184,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           const actualGeminiBody = (reqJson.request || reqJson) as GeminiRequestBody;
           // Resolve fileData URIs then route to translator
           resolveFileData(actualGeminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream);
+            handleCustomModelRequest(res, matchedCustomModel, actualGeminiBody, isStream, 0, [], trackingInfo);
           });
           return;
         }
@@ -2922,6 +3212,10 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const matchedModelName = isGenerate ? generateMatch![1] : streamMatch![1];
       try {
         const geminiBody = JSON.parse(bodyStr) as GeminiRequestBody;
+        const trackingInfo = extractTrackingInfo(undefined, req, geminiBody);
+        if (trackingInfo.conversationId) {
+          lastActiveConversationId = trackingInfo.conversationId;
+        }
         const autoSelection = resolveAutoSwitchModel(geminiBody, matchedModelName);
         if (autoSelection) {
           void resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() =>
@@ -2932,6 +3226,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
               isStandardStream,
               0,
               autoSelection.fallbacks,
+              trackingInfo,
             ),
           );
           return;
@@ -2945,12 +3240,16 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const providers = loadProviders();
       let geminiBody: GeminiRequestBody = {};
       try { geminiBody = JSON.parse(bodyStr) as GeminiRequestBody; } catch (_) {}
+      const trackingInfo = extractTrackingInfo(undefined, req, geminiBody);
+      if (trackingInfo.conversationId) {
+        lastActiveConversationId = trackingInfo.conversationId;
+      }
       const matchedCustomModel = resolveTargetCustomModel({ model: matchedModelName, request: geminiBody }, customModels, providers);
 
       if (matchedCustomModel) {
         try {
           resolveFileData(geminiBody, req.headers as Record<string, string | string[] | undefined>).then(() => {
-            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream);
+            handleCustomModelRequest(res, matchedCustomModel, geminiBody, isStandardStream, 0, [], trackingInfo);
           });
           return;
         } catch (e) {
@@ -2985,6 +3284,8 @@ export function startProxy(): Promise<number> {
       server!.listen(port, '127.0.0.1', () => {
         proxyPort = (server!.address() as import('net').AddressInfo).port;
         log.info(`[Proxy] Server listening on http://127.0.0.1:${proxyPort}`);
+        // Pre-fetch OpenRouter models for dynamic pricing & limits
+        fetchOpenRouterPublicModels().catch(() => {});
         resolve(proxyPort);
       });
     }
